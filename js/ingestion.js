@@ -1,401 +1,111 @@
-/* =====================================================================
-   ingestion.js — THE "ADDING QUESTIONS" MODULE
+/* ingestion.js — Mastery Exam patched ingestion/save logic
+   Keep your existing UI/modal/edit HTML. Replace the old ingestion logic with this.
+   Dependencies: core.js, gemini-model.js
+*/
+let currentIngestChapterId=null, quickAddCount=0, attachedImage=null, ingestBusy=false;
+let ingestSeenSigs=new Set();
 
-   Everything about turning raw text/voice/images into saved question
-   patterns lives here. If you only need to change how ingestion works
-   (the prompt, the pagination logic, dedup rules, the input box UI, the
-   manual add/edit forms), you only need to replace THIS file.
-
-   Two stopping modes, chosen automatically per request:
-     - Explicit instruction detected (e.g. "শুধু ১,৩,৪ নম্বর নাও", "only 5")
-       -> stop the moment the model reports done, or adds nothing new.
-          Never keeps pushing past what was actually asked for.
-     - No explicit instruction (plain bulk paste/notes)
-       -> keep asking for more, ignoring the model's own "hasMore" claim,
-          until a round genuinely adds zero new questions. This is what
-          makes large pastes (dozens of questions) come out complete.
-
-   Depends on (from core.js): sGet, DB, saveQuestions, toast, esc, openModal,
-     closeModal, onModalClose, normalizeSig
-   Depends on (from gemini-model.js): callGeminiAPI, openSettingsModal
-   Exposes to the rest of the app: openIngestModal(chapterId),
-     openQuestionEditForm(chapterId, questionId), insertQuestionFromItem,
-     dedupeChapterQuestions(chapterId)
-===================================================================== */
-
-let currentIngestChapterId = null;
-let quickAddCount = 0;
-let attachedImage = null;
-let ingestSeenSigs = new Set();
-let ingestBusy = false;
-
-// Guard against losing an in-flight round if the user closes/reloads mid-ingestion.
-// (Rounds that already completed are saved immediately and are never at risk.)
-window.addEventListener('beforeunload', (e)=>{
-  if(ingestBusy){ e.preventDefault(); e.returnValue = ''; }
-});
-
-// Heuristic: does the raw text look like it's asking for a SPECIFIC count/selection
-// (as opposed to "just extract everything you can find")? If so, ingestion must stop
-// exactly there instead of continuing to invent more.
-function detectsExplicitInstruction(rawText){
-  if(!rawText) return false;
-  const patterns = [
-    /শুধু/, /কেবল/, /\bonly\b/i, /\bjust\b/i,
-    /দাগানো/, /চিহ্নিত/, /মার্ক/i, /marked/i, /selected/i, /highlighted/i,
-    /[০-৯]+\s*[,ও]\s*[০-৯]+/, /\d+\s*,\s*\d+/, // a number list like "১,৩,৪" or "1,3,4"
-    /নম্বর\s*(প্রশ্ন|টা|টি)?\s*(নাও|দাও|বানাও)/, /no\.?\s*\d/i,
-    /(এই|উপরের|নিচের)?\s*[০-৯০-৯]*\s*টা\s*(বানাও|করো|দাও)/
-  ];
-  return patterns.some(p=>p.test(rawText));
+function cleanIngestText(s=''){return String(s).replace(/\s+/g,' ').trim()}
+function canonIngest(s=''){return cleanIngestText(s).toLowerCase().replace(/[“”"‘’'`]/g,'').replace(/[।,;:!?()[\]{}<>\/\\|+=_*^~$%#@-]/g,'').replace(/\s/g,'')}
+function ingestItemSig(q){
+  const opts=(q.options||q.optionExprs||[]).map(canonIngest).join('|');
+  return canonIngest(q.stem||'')+'||'+opts+'||'+String(q.correctIndex??'');
 }
-
-function buildIngestPrompt(rawText, hasImage, previousStems, continueFrom){
-  const continuationBlock = (previousStems && previousStems.length)
-    ? `\n\nতুমি এই সেশনে ইতিমধ্যে নিচের প্রশ্নগুলো বের করে ফেলেছ — এগুলো আর দিও না, পুনরাবৃত্তি করবে না:\n${previousStems.map((s,i)=>(i+1)+'. '+s).join('\n')}\n${continueFrom?`এরপর "${continueFrom}" থেকে ধারাবাহিকভাবে বাকিগুলো বের করা চালিয়ে যাও।`:'বাকি প্রশ্নগুলো বের করা চালিয়ে যাও।'}`
-    : '';
-  return `তুমি একজন বাংলাদেশের ভর্তি পরীক্ষা প্রস্তুতির অভিজ্ঞ শিক্ষক ও প্রশ্ন-বিশ্লেষক AI। ব্যবহারকারী নিচে টেক্সট এবং/অথবা একটা ছবি দেবে — একটামাত্র প্রশ্ন, শত শত লাইনের তালিকা, ভয়েস থেকে লেখা কাঁচা টেক্সট, বা বইয়ের/নোটের পাতার ছবি হতে পারে।
-
-গুরুত্বপূর্ণ অগ্রাধিকার নিয়ম: ব্যবহারকারীর টেক্সটে যদি কোনো স্পষ্ট নির্দেশনা/কমান্ড থাকে (যেমন "শুধু ১, ৩ ও ৪ নম্বর প্রশ্ন নাও", "এই অংশ থেকে ২০টা বানাও", "শুধু দাগানো প্রশ্নগুলো নাও"), সেটাই তোমার নিজের অনুমানের চেয়ে সবসময় বেশি গুরুত্ব পাবে — ঠিক ততটুকুই করবে, তার এক-প্রশ্নও বেশি না। এই ধরনের নির্দিষ্ট নির্দেশনা ইতিমধ্যে পুরোপুরি পূরণ হয়ে থাকলে "hasMore": false দিয়ে থেমে যাবে, এবং পরবর্তীতে "বাকিগুলো চালিয়ে যাও" জাতীয় কোনো অনুরোধ এলেও নতুন করে আরও প্রশ্ন বানাবে না — নির্দেশনার বাইরে একটাও অতিরিক্ত প্রশ্ন তৈরি করা যাবে না। কাজ শেষ করার আগে নিজে একবার মিলিয়ে দেখো তুমি ঠিক ব্যবহারকারীর বলা প্রশ্নগুলোই দিয়েছ কিনা। কোনো স্পষ্ট নির্দেশনা না থাকলে, প্রতিটা লাইন/অংশ/ছবির প্রতিটা কোণা মনোযোগ দিয়ে স্ক্যান করে যত প্রকৃত/গুরুত্বপূর্ণ প্রশ্ন পাওয়া যায় সবগুলোর জন্য আইটেম বানাও (কাঁচা নোট হলে নিজে থেকে ভালো মানের MCQ তৈরি করো)। ইনপুটে যদি একই প্রশ্ন একাধিকবার (হুবহু বা প্রায় হুবহু) থাকে, সেটাকে একবারই ধরবে।
-
-মানের জন্য অত্যন্ত গুরুত্বপূর্ণ: একবারে সর্বোচ্চ ১০টি প্রশ্ন বিস্তারিতভাবে বের করো, যাতে প্রতিটির বিশ্লেষণ নিখুঁত হয়। আরও বাকি থাকলে "hasMore": true দাও এবং "continueFrom"-এ পরের ধাপে কোথা থেকে চালিয়ে যেতে হবে তার সংক্ষিপ্ত ইঙ্গিত দাও। দীর্ঘ চিন্তা-প্রক্রিয়া দেখানোর দরকার নেই, সরাসরি চূড়ান্ত JSON দাও।
-
-প্রতিটা প্রশ্নের জন্য প্রথমে ঠিক করো:
-(ক) "numeric" — সাংখ্যিক/গাণিতিক সমস্যা, সংখ্যা বদলালে কাঠামো ঠিক রেখে নতুন প্রশ্ন হয়।
-(খ) "concept" — ধারণাভিত্তিক/তাত্ত্বিক/সাহিত্য/জীববিজ্ঞান/ইতিহাস/গ্রামার ইত্যাদি।
-
-"numeric" হলে:
-{"type":"numeric","stem":"বিবৃতি, $...$ দিয়ে গণিত, পরিবর্তনযোগ্য সংখ্যার জায়গায় {a},{b}..","variables":[{"name":"a","min":X,"max":Y}],"optionExprs":["সঠিক উত্তরের সূত্র","ভুল ১","ভুল ২","ভুল ৩"],"correctIndex":0,"explanation":"ধাপে ধাপে সম্পূর্ণ নির্ভুল ব্যাখ্যা"}
-সাংখ্যিক প্রশ্নে বাড়তি সতর্কতা (এখানে ভুল হলে পুরো প্রশ্নটাই অর্থহীন হয়ে যায়):
-- min ও max দুই প্রান্তেই বসিয়ে মনে মনে যাচাই করো — শূন্য দিয়ে ভাগ, ঋণাত্মক বর্গমূল, ভগ্নাংশ ফলাফল (পূর্ণসংখ্যা দরকার হলে), বা অবাস্তব মান যেন কোনো প্রান্তেই না আসে। যেমন {a}-{b} ব্যবহার করলে নিশ্চিত করো b সবসময় a-এর চেয়ে ছোট থাকে — দরকার হলে {a}+{b} আকারে সবসময়-ধনাত্মক সূত্র ব্যবহার করা সহজ।
-- ভেরিয়েবলের রেঞ্জ যথেষ্ট চওড়া রাখবে (প্রতিটিতে অন্তত ১০-১৫টি সম্ভাব্য পূর্ণসংখ্যা মান থাকা ভালো) — এই একটা প্যাটার্ন থেকে ভবিষ্যতে পরীক্ষায় বহুবার আলাদা আলাদা কপি তৈরি হবে, তাই রেঞ্জ সরু হলে বারবার একই সংখ্যা চলে আসতে পারে।
-- সংখ্যাগুলো ভর্তি পরীক্ষার মতোই হাতে-কলমে সহজে সমাধানযোগ্য রাখবে।
-- "explanation"-ও অবশ্যই stem-এর মতোই {a},{b}.. প্লেসহোল্ডার ব্যবহার করে জেনেরিকভাবে লিখবে (নির্দিষ্ট সংখ্যা যেমন সরাসরি "3" নয়, বরং "{a}") — কারণ পরীক্ষার সময় প্রতিবার ভিন্ন সংখ্যা বসবে, তাই ব্যাখ্যাও সেই একই ভেরিয়েবল দিয়ে লেখা থাকলে তবেই প্রতিবার সঠিক থাকবে।
-
-"concept" হলে:
-{"type":"concept","stem":"সম্পূর্ণ বিবৃতি","options":["...","...","...","..."],"correctIndex":0,"explanation":"ধাপে ধাপে সম্পূর্ণ নির্ভুল ব্যাখ্যা"}
-
-প্রশ্ন কোনো চিত্র/figure-নির্ভর হলে প্রয়োজনীয় মান/সম্পর্ক লেখাতেই বর্ণনা করে দাও যাতে ছবি ছাড়াও সমাধানযোগ্য থাকে। ব্যাখ্যা সবসময় সর্বোচ্চ নির্ভুল ও ধাপে ধাপে হতে হবে।
-
-ঠিক এই আকারে আউটপুট দাও (অন্য কিছু লিখবে না, মার্কডাউন কোড ব্লকও না):
-{ "items":[ ...উপরের যেকোনো একটা স্কিমা অনুযায়ী আইটেম... ], "hasMore":true/false, "continueFrom":"..." }
-
-মূল ভাষা (বাংলা/ইংরেজি) বজায় রাখো। শুধু বৈধ JSON দাও।${continuationBlock}
-
-ব্যবহারকারীর টেক্সট/নির্দেশনা:
-${rawText || '(সংযুক্ত ছবি বিশ্লেষণ/স্ক্যান করো)'}`;
+function ingestSimilarity(a,b){
+  a=canonIngest(a);b=canonIngest(b);if(!a||!b)return 0;if(a===b)return 1;
+  const A=new Set(a.match(/[a-z\u0980-\u09ff0-9]+/g)||[]),B=new Set(b.match(/[a-z\u0980-\u09ff0-9]+/g)||[]);
+  let n=0;A.forEach(x=>B.has(x)&&n++);return n/Math.max(1,new Set([...A,...B]).size);
 }
+function ingestNearDuplicate(stem,list){
+  const s=canonIngest(stem);if(!s)return true;
+  return list.some(q=>canonIngest(q.stem)===s||ingestSimilarity(q.stem,stem)>=.94);
+}
+function fourDistinct(a){return Array.isArray(a)&&a.length===4&&a.every(x=>cleanIngestText(x))&&new Set(a.map(canonIngest)).size===4}
+function explicitSelection(s=''){
+  return /শুধু|কেবল|only|just|দাগানো|চিহ্নিত|মার্ক|marked|selected|highlighted/i.test(s) ||
+    /(?:নম্বর|no\.?|question)\s*[০-৯0-9]+(?:\s*[,ও&]\s*[০-৯0-9]+)+/i.test(s);
+}
+function buildIngestPrompt(raw='',hasImage=false,previous=[]){
+  const prev=previous.length?`\nইতিমধ্যে নেওয়া stem — এগুলো পুনরায় দেবে না:\n${previous.map((x,i)=>`${i+1}. ${x}`).join('\n')}`:'';
+  return `তুমি বাংলাদেশের ভর্তি পরীক্ষার জন্য একটি STRICT question-bank extraction AI।
 
-function openIngestModal(chapterId){
-  currentIngestChapterId = chapterId;
-  ingestSeenSigs = new Set(DB.questions.filter(q=>q.chapterId===chapterId).map(q=>normalizeSig(q.stem)).filter(Boolean));
+ইনপুট TEXT এবং/অথবা IMAGE থেকে শুধু ব্যবহারকারী যে প্রশ্ন/তথ্য নির্বাচন করেছে সেগুলোকে MCQ pattern-এ সংরক্ষণযোগ্য item বানাও।
 
-  // Whatever path the modal closes through (✕ backdrop click, Escape, or the button below),
-  // always refresh the chapter's question list underneath so newly-added items are visible.
-  onModalClose(()=>{
-    if(location.hash.startsWith('#/templates/')){
-      const view = document.getElementById('view');
-      if(view) view.innerHTML = viewQuestionList(chapterId);
-    }
-  });
+কঠোর নিয়ম:
+- "শুধু/কেবল/marked/selected/দাগানো/চিহ্নিত/নির্দিষ্ট নম্বর" থাকলে তার বাইরে একটিও item বানাবে না।
+- ছবিতে দাগানো/circled/highlighted প্রশ্ন থাকলে শুধু সেগুলো নাও; একই পাতার অন্য প্রশ্ন নিও না।
+- raw textbook line/note হলে শুধু ওই selected line/fact থেকে প্রয়োজনীয় MCQ বানাও। একটি ছোট অংশকে কেন্দ্র করে 20/40টি নতুন topic question বানাবে না।
+- নতুন chapter, নতুন fact, অনুমান বা শেখানোর জন্য extra question যোগ করবে না।
+- মূল concept, required knowledge, solving method ও answer logic অপরিবর্তিত রাখবে।
+- বাংলা/ইংরেজি মূল ভাষা বজায় রাখবে।
+- Math equation $...$ এর মধ্যে রাখবে; formula/text ভাঙবে না।
+- Figure দরকার হলে শুধু ছবিতে থাকা নির্দিষ্ট relation/value ব্যবহার করবে; কল্পিত data নয়।
+- concept item-এ ঠিক 4টি distinct option এবং exactly one correct।
+- numeric item-এ 4টি distinct option, valid variable ranges এবং সব expression valid হতে হবে।
+- fixed factual answer-কে fake variation বানাবে না।
+- শুধু বৈধ JSON output দাও।
 
-  openModal(`
-    <h3>নতুন প্রশ্ন যোগ করো (AI)</h3>
-    <p class="hint" style="margin-bottom:10px;">একটা প্রশ্ন লেখো, একসাথে অনেক প্রশ্ন পেস্ট করো, কাঁচা নোট দাও, ছবি তুলে/পেস্ট করে দাও — সাথে চাইলে নির্দিষ্ট নির্দেশনাও লেখো (যেমন "শুধু ১,৩,৪ নম্বর নাও")।</p>
-    <div class="unified-input">
-      <div id="attach-preview" class="attach-preview" style="display:none;">
-        <img id="attach-thumb" src="">
-        <span class="hint" style="flex:1;">ছবি সংযুক্ত হয়েছে</span>
-        <button type="button" onclick="clearAttachment()">✕</button>
-      </div>
-      <div class="input-row">
-        <button type="button" class="input-icon-btn" id="mic-btn" onclick="toggleVoiceInput()" title="বলে টাইপ করো">🎤</button>
-        <textarea id="ai-raw-text" rows="4" placeholder="এখানে লেখো/পেস্ট করো, বা ছবি পেস্ট করো (Ctrl+V)..." oninput="autoGrowInput(this)"></textarea>
-        <button type="button" class="input-icon-btn" onclick="document.getElementById('ai-image-input').click()" title="ছবি সংযুক্ত করো">📷</button>
-        <button type="button" class="input-send-btn" id="ai-parse-btn" onclick="runIngest()" title="AI দিয়ে যোগ করো (Enter)">⚡</button>
-      </div>
-    </div>
-    <input type="file" id="ai-image-input" accept="image/*" capture="environment" style="display:none;" onchange="previewAttachment(this)">
-    <div class="hint" style="text-align:center; margin-top:6px;">এই সেশনে যোগ হয়েছে: <b id="quick-add-count">0</b> টি প্রশ্ন · <span class="kbd-hint">Enter</span> পাঠাতে, <span class="kbd-hint">Shift+Enter</span> নতুন লাইনের জন্য</div>
-    <details style="margin-top:16px;">
-      <summary class="link-btn" style="cursor:pointer;">নিজে হাতে প্রশ্ন লিখতে চাইলে এখানে ক্লিক করো</summary>
-      <div style="margin-top:12px;">
-        <div class="field"><label>প্রশ্নের বিবৃতি</label><textarea id="q-stem-manual" placeholder="প্রশ্ন লেখো, গণিতের জন্য $...$ ব্যবহার করো"></textarea></div>
-        <div class="field"><label>অপশন — সঠিক উত্তরে বাটন চাপুন</label>
-          <div id="q-opt-rows">${[0,1,2,3].map(i=>manualOptRow('',i,i===0)).join('')}</div>
-        </div>
-        <div class="field"><label>ব্যাখ্যা (ঐচ্ছিক)</label><textarea id="q-expl-manual"></textarea></div>
-        <button class="btn btn-primary btn-block" onclick="saveManualQuestion('${chapterId}','')">এটা ম্যানুয়ালি সংরক্ষণ করো</button>
-      </div>
-    </details>
-    <button class="btn btn-block" style="margin-top:14px;" onclick="closeModal()">শেষ, বন্ধ করো</button>
-  `);
-  quickAddCount = 0; attachedImage = null;
-  const ta = document.getElementById('ai-raw-text');
-  if(ta){
-    ta.addEventListener('paste', handlePasteForImage);
-    setTimeout(()=>ta.focus(),50);
+${explicitSelection(raw)?'এটি EXPLICIT selection: অতিরিক্ত item সম্পূর্ণ নিষিদ্ধ।':'Bulk input: source-এ যত প্রকৃত selected question/fact আছে ততটাই নাও; topic expansion কোরো না।'}
+${prev}
+
+JSON:
+{"items":[{"type":"concept","stem":"...","options":["...","...","...","..."],"correctIndex":0,"explanation":"..."},{"type":"numeric","stem":"... {a} ...","variables":[{"name":"a","min":5,"max":25}],"optionExprs":["...","...","...","..."],"correctIndex":0,"explanation":"... {a} ..."}],"hasMore":false,"continueFrom":""}
+
+USER INPUT:
+${raw||'(IMAGE ONLY — inspect the image carefully)'}
+`;
+}
+function normalizeIngestItem(it){
+  if(!it||!it.type||!cleanIngestText(it.stem))return null;
+  if(it.type==='numeric'){
+    const q={id:uid(),chapterId:currentIngestChapterId,type:'numeric',stem:cleanIngestText(it.stem),
+      variables:Array.isArray(it.variables)?it.variables.map(v=>({name:String(v.name||''),min:Number(v.min),max:Number(v.max)})):[],
+      optionExprs:Array.isArray(it.optionExprs)?it.optionExprs.map(String):[],
+      correctIndex:Number(it.correctIndex),explanation:cleanIngestText(it.explanation||'')};
+    if(q.optionExprs.length!==4||!Number.isInteger(q.correctIndex)||q.correctIndex<0||q.correctIndex>3)return null;
+    if(!q.variables.length||q.variables.some(v=>!/^[A-Za-z]\w*$/.test(v.name)||!Number.isFinite(v.min)||!Number.isFinite(v.max)||v.min>v.max||v.max-v.min<3))return null;
+    return q;
   }
-}
-
-/* ---- clipboard image paste support ---- */
-function handlePasteForImage(e){
-  const items = (e.clipboardData || e.originalEvent?.clipboardData)?.items;
-  if(!items) return;
-  for(const item of items){
-    if(item.type && item.type.startsWith('image/')){
-      const file = item.getAsFile();
-      if(file){
-        e.preventDefault();
-        fileToBase64(file).then(b64=>{
-          attachedImage = { base64: b64, mime: file.type };
-          const thumb = document.getElementById('attach-thumb');
-          const preview = document.getElementById('attach-preview');
-          if(thumb) thumb.src = 'data:'+file.type+';base64,'+b64;
-          if(preview) preview.style.display = 'flex';
-          toast('📷 ছবি পেস্ট হয়েছে');
-        });
-      }
-      break;
-    }
+  if(it.type==='concept'&&fourDistinct(it.options)){
+    const q={id:uid(),chapterId:currentIngestChapterId,type:'concept',stem:cleanIngestText(it.stem),
+      options:it.options.map(cleanIngestText),correctIndex:Number(it.correctIndex),explanation:cleanIngestText(it.explanation||'')};
+    return Number.isInteger(q.correctIndex)&&q.correctIndex>=0&&q.correctIndex<4?q:null;
   }
+  return null;
 }
-
-function manualOptRow(val, i, checked){
-  return `<div class="opt-row">
-    <input type="radio" name="q-correct-opt" value="${i}" ${checked?'checked':''}>
-    <input type="text" class="q-opt-manual" value="${esc(val)}" placeholder="অপশন ${i+1}">
-  </div>`;
+async function insertQuestionFromItem(chapterId,item){
+  const q=normalizeIngestItem({...item,chapterId});if(!q)return false;
+  const existing=DB.questions.filter(x=>x.chapterId===chapterId);
+  if(ingestNearDuplicate(q.stem,existing)||ingestSeenSigs.has(ingestItemSig(q)))return false;
+  DB.questions.push(q);ingestSeenSigs.add(ingestItemSig(q));return true;
 }
-async function saveManualQuestion(chapterId, questionId){
-  const stem = document.getElementById('q-stem-manual').value.trim();
-  if(!stem) return toast('প্রশ্ন লিখুন');
-  const opts = [...document.querySelectorAll('.q-opt-manual')].map(x=>x.value.trim());
-  if(opts.some(o=>!o)) return toast('সব অপশন পূরণ করুন');
-  const checked = document.querySelector('input[name=q-correct-opt]:checked');
-  const correctIndex = checked ? parseInt(checked.value) : 0;
-  const explanation = document.getElementById('q-expl-manual').value.trim();
-  if(questionId){
-    const q = DB.questions.find(x=>x.id===questionId);
-    Object.assign(q, {stem, options:opts, correctIndex, explanation});
-  } else {
-    DB.questions.push({id:uid(), chapterId, type:'concept', stem, options:opts, correctIndex, explanation});
-  }
-  await saveQuestions(); closeModal(); toast('সংরক্ষিত হয়েছে');
-  const view = document.getElementById('view');
-  if(view) view.innerHTML = viewQuestionList(chapterId);
-}
-function openQuestionEditForm(chapterId, questionId){
-  const q = DB.questions.find(x=>x.id===questionId);
-  if(!q) return;
-  if(q.type==='numeric') openNumericEditForm(chapterId, q);
-  else openConceptEditForm(chapterId, q);
-}
-function openConceptEditForm(chapterId, q){
-  openModal(`
-    <h3>প্রশ্ন সম্পাদনা</h3>
-    <div class="field"><label>প্রশ্নের বিবৃতি</label><textarea id="q-stem-manual">${esc(q.stem)}</textarea></div>
-    <div class="field"><label>অপশন — সঠিক উত্তরে বাটন চাপুন</label><div id="q-opt-rows">${q.options.map((o,i)=>manualOptRow(o,i,i===q.correctIndex)).join('')}</div></div>
-    <div class="field"><label>ব্যাখ্যা (ঐচ্ছিক)</label><textarea id="q-expl-manual">${esc(q.explanation||'')}</textarea></div>
-    <div class="btn-row">
-      <button class="btn btn-primary" onclick="saveManualQuestion('${chapterId}','${q.id}')">সংরক্ষণ করুন</button>
-      <button class="btn" onclick="closeModal()">বাতিল</button>
-    </div>`);
-}
-function varRow(v){
-  return `<div class="field-row" style="margin-bottom:8px;">
-    <div class="field" style="flex:.6;"><input class="var-name" value="${esc(v.name)}" placeholder="নাম যেমন a"></div>
-    <div class="field"><input class="var-min" type="number" value="${v.min}" placeholder="min"></div>
-    <div class="field"><input class="var-max" type="number" value="${v.max}" placeholder="max"></div>
-  </div>`;
-}
-function addVarRow(){ document.getElementById('var-rows').insertAdjacentHTML('beforeend', varRow({name:'',min:1,max:9})); }
-function optRow(val, i, checked){
-  return `<div class="opt-row"><input type="radio" name="correct-opt" value="${i}" ${checked?'checked':''}><input type="text" class="opt-expr" value="${esc(val)}" placeholder="সূত্র, যেমন {a}+{b}"></div>`;
-}
-function openNumericEditForm(chapterId, q){
-  const vars = q.variables||[]; const opts = q.optionExprs||[]; const correctIndex = q.correctIndex||0;
-  openModal(`
-    <h3>প্রশ্ন সম্পাদনা (সাংখ্যিক)</h3>
-    <div class="field"><label>প্রশ্নের বিবৃতি ({a},{b} ও $...$ ব্যবহার করুন)</label><textarea id="tpl-stem">${esc(q.stem)}</textarea></div>
-    <div class="field"><label>ভেরিয়েবলের সীমা</label>
-      <div id="var-rows">${vars.map(v=>varRow(v)).join('')}</div>
-      <button class="link-btn" type="button" onclick="addVarRow()">+ ভেরিয়েবল যোগ</button>
-    </div>
-    <div class="field"><label>অপশন (সূত্র আকারে) — সঠিক উত্তরে বাটন চাপুন</label>
-      <div id="opt-rows">${opts.map((o,i)=>optRow(o,i,i===correctIndex)).join('')}</div>
-    </div>
-    <div class="field"><label>ব্যাখ্যা ({a},{b} প্লেসহোল্ডার ব্যবহার করুন, ঐচ্ছিক)</label><textarea id="tpl-expl">${esc(q.explanation||'')}</textarea></div>
-    <div class="btn-row">
-      <button class="btn btn-primary" onclick="saveNumericEdit('${chapterId}','${q.id}')">সংরক্ষণ করুন</button>
-      <button class="btn" onclick="closeModal()">বাতিল</button>
-    </div>`);
-}
-async function saveNumericEdit(chapterId, questionId){
-  const stem = document.getElementById('tpl-stem').value.trim();
-  if(!stem) return toast('প্রশ্ন লিখুন');
-  const names=[...document.querySelectorAll('.var-name')].map(x=>x.value.trim());
-  const mins=[...document.querySelectorAll('.var-min')].map(x=>parseFloat(x.value));
-  const maxs=[...document.querySelectorAll('.var-max')].map(x=>parseFloat(x.value));
-  const variables = names.map((nm,i)=>({name:nm,min:mins[i],max:maxs[i]})).filter(v=>v.name);
-  const exprs=[...document.querySelectorAll('.opt-expr')].map(x=>x.value.trim());
-  const correctRadio=document.querySelector('input[name=correct-opt]:checked');
-  const correctIndex=correctRadio?parseInt(correctRadio.value):0;
-  const explanation=document.getElementById('tpl-expl').value.trim();
-  if(exprs.some(e=>!e)) return toast('সব অপশন পূরণ করুন');
-  const q=DB.questions.find(x=>x.id===questionId);
-  Object.assign(q,{stem, variables, optionExprs:exprs, correctIndex, explanation});
-  await saveQuestions(); closeModal(); toast('সংরক্ষিত হয়েছে');
-  const view = document.getElementById('view');
-  if(view) view.innerHTML = viewQuestionList(chapterId);
-}
-function insertQuestionFromItem(chapterId, item){
-  if(!item || !item.type) return false;
-  if(item.type==='numeric'){
-    if(!item.stem || !Array.isArray(item.optionExprs) || item.optionExprs.length<2) return false;
-    DB.questions.push({
-      id:uid(), chapterId, type:'numeric', stem:item.stem,
-      variables: Array.isArray(item.variables)?item.variables:[],
-      optionExprs:item.optionExprs,
-      correctIndex: Number.isInteger(item.correctIndex)?item.correctIndex:0,
-      explanation:item.explanation||''
-    });
-    return true;
-  }
-  if(item.type==='concept'){
-    if(!item.stem || !Array.isArray(item.options) || item.options.length<2) return false;
-    let ci = Number.isInteger(item.correctIndex)?item.correctIndex:0;
-    if(ci<0||ci>=item.options.length) ci=0;
-    DB.questions.push({ id:uid(), chapterId, type:'concept', stem:item.stem, options:item.options, correctIndex:ci, explanation:item.explanation||'' });
-    return true;
-  }
-  return false;
+async function dedupeChapterQuestions(chapterId){
+  const list=DB.questions.filter(q=>q.chapterId===chapterId),keep=[],seen=new Set();let removed=0;
+  for(const q of list){const sig=ingestItemSig(q);if(seen.has(sig)||ingestNearDuplicate(q.stem,keep)){removed++;continue}seen.add(sig);keep.push(q)}
+  const ids=new Set(keep.map(q=>q.id));DB.questions=DB.questions.filter(q=>q.chapterId!==chapterId||ids.has(q.id));
+  await saveQuestions();toast(removed?`ডুপ্লিকেট ${removed}টি মুছে ফেলা হয়েছে`:'কোনো ডুপ্লিকেট পাওয়া যায়নি');
+  const v=document.getElementById('view');if(v)v.innerHTML=viewQuestionList(chapterId);
 }
 async function runIngest(){
-  const rawTextEl = document.getElementById('ai-raw-text');
-  const rawText = rawTextEl ? rawTextEl.value.trim() : '';
-  if(!rawText && !attachedImage){ toast('টেক্সট লেখো, বলো, অথবা ছবি দাও'); return; }
-  const apiKey = await sGet('geminiApiKey');
-  if(!apiKey){ toast('প্রথমে Gemini API Key সেট করো'); openSettingsModal(); return; }
-
-  const btn = document.getElementById('ai-parse-btn');
-  btn.disabled = true; const prevLabel = btn.textContent;
-  ingestBusy = true;
-
-  const hasExplicit = detectsExplicitInstruction(rawText);
-  let totalAdded = 0, round = 0, continueFrom = '';
-  const previousStems = [];
-  const MAX_ROUNDS = 15;
+  const el=document.getElementById('ai-raw-text'),raw=el?el.value.trim():'';
+  if(!raw&&!attachedImage)return toast('টেক্সট লেখো, অথবা ছবি দাও');
+  const key=await sGet('geminiApiKey');if(!key){toast('প্রথমে Gemini API Key সেট করো');if(typeof openSettingsModal==='function')openSettingsModal();return}
+  if(ingestBusy)return;ingestBusy=true;
+  const btn=document.getElementById('ai-parse-btn');if(btn){btn.disabled=true;btn.textContent='প্রশ্ন যাচাই হচ্ছে…'}
+  let total=0,round=0,previous=[];const explicit=explicitSelection(raw);
   try{
-    while(round < MAX_ROUNDS){
-      round++;
-      btn.textContent = round===1 ? '⏳' : ('⏳'+round);
-      const prompt = buildIngestPrompt(rawText, !!attachedImage, previousStems, continueFrom);
-      const data = await callGeminiAPI({
-        text: prompt,
-        imageBase64: attachedImage ? attachedImage.base64 : undefined,
-        imageMime: attachedImage ? attachedImage.mime : undefined
-      });
-      const items = Array.isArray(data.items) ? data.items : [];
-      let addedThisRound = 0;
-      items.forEach(it=>{
-        const sig = normalizeSig(it.stem);
-        if(sig && ingestSeenSigs.has(sig)) return; // duplicate — skip silently
-        if(insertQuestionFromItem(currentIngestChapterId, it)){
-          addedThisRound++;
-          if(sig) ingestSeenSigs.add(sig);
-          previousStems.push((it.stem||'').slice(0,90));
-        }
-      });
-      if(addedThisRound>0){
-        await saveQuestions(); // persisted immediately — closing the modal is never required for this to stick
-        totalAdded += addedThisRound;
-        quickAddCount += addedThisRound;
-        const c1 = document.getElementById('quick-add-count'); if(c1) c1.textContent = quickAddCount;
-      }
-      continueFrom = data.continueFrom || '';
-      const modelSaysDone = data.hasMore === false;
-
-      if(hasExplicit){
-        // The user asked for something specific (a count, specific numbers, marked items).
-        // Stop the instant the model says it's satisfied, or the instant nothing new comes
-        // back — NEVER keep inventing extra questions beyond what was actually requested.
-        if(modelSaysDone || addedThisRound===0) break;
-      } else {
-        // Plain bulk paste — don't trust a premature "done" claim, only stop on genuine
-        // exhaustion (a round that adds nothing new).
-        if(addedThisRound===0) break;
-      }
+    while(round++<20){
+      let data=null;
+      try{data=await callGeminiAPI({text:buildIngestPrompt(raw,!!attachedImage,previous),
+        imageBase64:attachedImage?.base64,imageMime:attachedImage?.mime})}catch(e){}
+      const items=Array.isArray(data?.items)?data.items.slice(0,10):[];let added=0;
+      for(const it of items){if(await insertQuestionFromItem(currentIngestChapterId,it)){added++;total++;previous.push(cleanIngestText(it.stem).slice(0,180))}}
+      if(added)await saveQuestions();
+      if(explicit||!added||data?.hasMore===false)break;
     }
-    if(totalAdded===0) toast('AI কোনো নতুন প্রশ্ন শনাক্ত করতে পারেনি, আরেকটু স্পষ্ট করে দাও');
-    else {
-      rawTextEl.value=''; autoGrowInput(rawTextEl); clearAttachment();
-      toast(`✅ মোট ${totalAdded} টি প্রশ্ন যোগ হয়েছে`);
-      rawTextEl.focus();
-    }
-  }catch(e){
-    if(e.message==='NO_API_KEY'){ toast('প্রথমে API Key সেট করো'); openSettingsModal(); }
-    else if(totalAdded>0) toast(`⚠ আংশিক সম্পন্ন — ${totalAdded} টি প্রশ্ন যোগ হয়েছে (এগুলো সেভ হয়ে গেছে), তারপর সমস্যা: ${e.message}`);
-    else toast('সমস্যা হয়েছে: ' + e.message);
-  }finally{
-    btn.disabled = false; btn.textContent = prevLabel;
-    ingestBusy = false;
-  }
+    if(total){if(el){el.value='';if(typeof autoGrowInput==='function')autoGrowInput(el)}if(typeof clearAttachment==='function')clearAttachment();toast(`✓ ${total} টি নতুন প্রশ্ন সংরক্ষিত হয়েছে`)}
+    else toast('নতুন কোনো বৈধ প্রশ্ন পাওয়া যায়নি');
+    const v=document.getElementById('view');if(v&&location.hash.startsWith('#/templates/'))v.innerHTML=viewQuestionList(currentIngestChapterId);
+  }finally{ingestBusy=false;if(btn){btn.disabled=false;btn.textContent='AI দিয়ে যোগ করুন'}}
 }
 
-/* ---- duplicate cleanup (for chapters that already accumulated repeats before this fix) ---- */
-async function dedupeChapterQuestions(chapterId){
-  const seen = new Set();
-  let removed = 0;
-  DB.questions = DB.questions.filter(q=>{
-    if(q.chapterId!==chapterId) return true;
-    const sig = normalizeSig(q.stem);
-    if(sig && seen.has(sig)){ removed++; return false; }
-    if(sig) seen.add(sig);
-    return true;
-  });
-  await saveQuestions();
-  toast(removed>0 ? `✅ ${removed} টি ডুপ্লিকেট মুছে ফেলা হয়েছে` : 'কোনো ডুপ্লিকেট পাওয়া যায়নি');
-  const view = document.getElementById('view');
-  if(view) view.innerHTML = viewQuestionList(chapterId);
-}
-
-/* ---- unified input helpers ---- */
-function autoGrowInput(el){ el.style.height='auto'; el.style.height = Math.min(el.scrollHeight, 260) + 'px'; }
-function previewAttachment(input){
-  const file = input.files[0]; if(!file) return;
-  fileToBase64(file).then(b64=>{
-    attachedImage = { base64: b64, mime: file.type };
-    document.getElementById('attach-thumb').src = 'data:'+file.type+';base64,'+b64;
-    document.getElementById('attach-preview').style.display = 'flex';
-  });
-}
-function clearAttachment(){
-  attachedImage = null;
-  const input = document.getElementById('ai-image-input'); if(input) input.value = '';
-  const preview = document.getElementById('attach-preview'); if(preview) preview.style.display = 'none';
-}
-function fileToBase64(file){
-  return new Promise((resolve,reject)=>{
-    const r = new FileReader();
-    r.onload = ()=> resolve(r.result.split(',')[1]);
-    r.onerror = reject;
-    r.readAsDataURL(file);
-  });
-}
-let recognition;
-function toggleVoiceInput(){
-  const btn = document.getElementById('mic-btn');
-  const ta = document.getElementById('ai-raw-text');
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if(!SR){ toast('এই ব্রাউজারে ভয়েস ইনপুট নেই — Chrome ব্যবহার করো'); return; }
-  if(recognition && recognition._active){ recognition.stop(); return; }
-  recognition = new SR();
-  recognition.lang = 'bn-BD'; recognition.interimResults = false; recognition.maxAlternatives = 1;
-  recognition._active = true;
-  btn.classList.add('recording'); btn.textContent = '🔴';
-  recognition.onresult = (e)=>{ const t = e.results[0][0].transcript; ta.value = (ta.value?ta.value+' ':'')+t; autoGrowInput(ta); };
-  recognition.onerror = ()=>{ toast('ভয়েস বোঝা যায়নি, আবার চেষ্টা করো'); };
-  recognition.onend = ()=>{ recognition._active = false; btn.classList.remove('recording'); btn.textContent = '🎤'; };
-  recognition.start();
-}
