@@ -6,11 +6,21 @@
    (the prompt, the pagination logic, dedup rules, the input box UI, the
    manual add/edit forms), you only need to replace THIS file.
 
+   Two stopping modes, chosen automatically per request:
+     - Explicit instruction detected (e.g. "শুধু ১,৩,৪ নম্বর নাও", "only 5")
+       -> stop the moment the model reports done, or adds nothing new.
+          Never keeps pushing past what was actually asked for.
+     - No explicit instruction (plain bulk paste/notes)
+       -> keep asking for more, ignoring the model's own "hasMore" claim,
+          until a round genuinely adds zero new questions. This is what
+          makes large pastes (dozens of questions) come out complete.
+
    Depends on (from core.js): sGet, DB, saveQuestions, toast, esc, openModal,
      closeModal, onModalClose, normalizeSig
    Depends on (from gemini-model.js): callGeminiAPI, openSettingsModal
    Exposes to the rest of the app: openIngestModal(chapterId),
-     openQuestionEditForm(chapterId, questionId), insertQuestionFromItem
+     openQuestionEditForm(chapterId, questionId), insertQuestionFromItem,
+     dedupeChapterQuestions(chapterId)
 ===================================================================== */
 
 let currentIngestChapterId = null;
@@ -25,15 +35,30 @@ window.addEventListener('beforeunload', (e)=>{
   if(ingestBusy){ e.preventDefault(); e.returnValue = ''; }
 });
 
+// Heuristic: does the raw text look like it's asking for a SPECIFIC count/selection
+// (as opposed to "just extract everything you can find")? If so, ingestion must stop
+// exactly there instead of continuing to invent more.
+function detectsExplicitInstruction(rawText){
+  if(!rawText) return false;
+  const patterns = [
+    /শুধু/, /কেবল/, /\bonly\b/i, /\bjust\b/i,
+    /দাগানো/, /চিহ্নিত/, /মার্ক/i, /marked/i, /selected/i, /highlighted/i,
+    /[০-৯]+\s*[,ও]\s*[০-৯]+/, /\d+\s*,\s*\d+/, // a number list like "১,৩,৪" or "1,3,4"
+    /নম্বর\s*(প্রশ্ন|টা|টি)?\s*(নাও|দাও|বানাও)/, /no\.?\s*\d/i,
+    /(এই|উপরের|নিচের)?\s*[০-৯০-৯]*\s*টা\s*(বানাও|করো|দাও)/
+  ];
+  return patterns.some(p=>p.test(rawText));
+}
+
 function buildIngestPrompt(rawText, hasImage, previousStems, continueFrom){
   const continuationBlock = (previousStems && previousStems.length)
     ? `\n\nতুমি এই সেশনে ইতিমধ্যে নিচের প্রশ্নগুলো বের করে ফেলেছ — এগুলো আর দিও না, পুনরাবৃত্তি করবে না:\n${previousStems.map((s,i)=>(i+1)+'. '+s).join('\n')}\n${continueFrom?`এরপর "${continueFrom}" থেকে ধারাবাহিকভাবে বাকিগুলো বের করা চালিয়ে যাও।`:'বাকি প্রশ্নগুলো বের করা চালিয়ে যাও।'}`
     : '';
   return `তুমি একজন বাংলাদেশের ভর্তি পরীক্ষা প্রস্তুতির অভিজ্ঞ শিক্ষক ও প্রশ্ন-বিশ্লেষক AI। ব্যবহারকারী নিচে টেক্সট এবং/অথবা একটা ছবি দেবে — একটামাত্র প্রশ্ন, শত শত লাইনের তালিকা, ভয়েস থেকে লেখা কাঁচা টেক্সট, বা বইয়ের/নোটের পাতার ছবি হতে পারে।
 
-গুরুত্বপূর্ণ অগ্রাধিকার নিয়ম: ব্যবহারকারীর টেক্সটে যদি কোনো স্পষ্ট নির্দেশনা/কমান্ড থাকে (যেমন "শুধু ১, ৩ ও ৪ নম্বর প্রশ্ন নাও", "এই অংশ থেকে ২০টা বানাও", "শুধু দাগানো প্রশ্নগুলো নাও"), সেটাই তোমার নিজের অনুমানের চেয়ে সবসময় বেশি গুরুত্ব পাবে — ঠিক ততটুকুই করবে, তার বেশি বা কম নয়। কাজ শেষ করার আগে নিজে একবার মিলিয়ে দেখো তুমি ঠিক ব্যবহারকারীর বলা প্রশ্নগুলোই দিয়েছ কিনা। কোনো স্পষ্ট নির্দেশনা না থাকলে, প্রতিটা লাইন/অংশ/ছবির প্রতিটা কোণা মনোযোগ দিয়ে স্ক্যান করে যত প্রকৃত/গুরুত্বপূর্ণ প্রশ্ন পাওয়া যায় সবগুলোর জন্য আইটেম বানাও (কাঁচা নোট হলে নিজে থেকে ভালো মানের MCQ তৈরি করো)। ইনপুটে যদি একই প্রশ্ন একাধিকবার (হুবহু বা প্রায় হুবহু) থাকে, সেটাকে একবারই ধরবে।
+গুরুত্বপূর্ণ অগ্রাধিকার নিয়ম: ব্যবহারকারীর টেক্সটে যদি কোনো স্পষ্ট নির্দেশনা/কমান্ড থাকে (যেমন "শুধু ১, ৩ ও ৪ নম্বর প্রশ্ন নাও", "এই অংশ থেকে ২০টা বানাও", "শুধু দাগানো প্রশ্নগুলো নাও"), সেটাই তোমার নিজের অনুমানের চেয়ে সবসময় বেশি গুরুত্ব পাবে — ঠিক ততটুকুই করবে, তার এক-প্রশ্নও বেশি না। এই ধরনের নির্দিষ্ট নির্দেশনা ইতিমধ্যে পুরোপুরি পূরণ হয়ে থাকলে "hasMore": false দিয়ে থেমে যাবে, এবং পরবর্তীতে "বাকিগুলো চালিয়ে যাও" জাতীয় কোনো অনুরোধ এলেও নতুন করে আরও প্রশ্ন বানাবে না — নির্দেশনার বাইরে একটাও অতিরিক্ত প্রশ্ন তৈরি করা যাবে না। কাজ শেষ করার আগে নিজে একবার মিলিয়ে দেখো তুমি ঠিক ব্যবহারকারীর বলা প্রশ্নগুলোই দিয়েছ কিনা। কোনো স্পষ্ট নির্দেশনা না থাকলে, প্রতিটা লাইন/অংশ/ছবির প্রতিটা কোণা মনোযোগ দিয়ে স্ক্যান করে যত প্রকৃত/গুরুত্বপূর্ণ প্রশ্ন পাওয়া যায় সবগুলোর জন্য আইটেম বানাও (কাঁচা নোট হলে নিজে থেকে ভালো মানের MCQ তৈরি করো)। ইনপুটে যদি একই প্রশ্ন একাধিকবার (হুবহু বা প্রায় হুবহু) থাকে, সেটাকে একবারই ধরবে।
 
-মানের জন্য অত্যন্ত গুরুত্বপূর্ণ: একবারে সর্বোচ্চ ১০টি প্রশ্ন বিস্তারিতভাবে বের করো, যাতে প্রতিটির বিশ্লেষণ নিখুঁত হয়। আরও বাকি থাকলে "hasMore": true দাও এবং "continueFrom"-এ পরের ধাপে কোথা থেকে চালিয়ে যেতে হবে তার সংক্ষিপ্ত ইঙ্গিত দাও।
+মানের জন্য অত্যন্ত গুরুত্বপূর্ণ: একবারে সর্বোচ্চ ১০টি প্রশ্ন বিস্তারিতভাবে বের করো, যাতে প্রতিটির বিশ্লেষণ নিখুঁত হয়। আরও বাকি থাকলে "hasMore": true দাও এবং "continueFrom"-এ পরের ধাপে কোথা থেকে চালিয়ে যেতে হবে তার সংক্ষিপ্ত ইঙ্গিত দাও। দীর্ঘ চিন্তা-প্রক্রিয়া দেখানোর দরকার নেই, সরাসরি চূড়ান্ত JSON দাও।
 
 প্রতিটা প্রশ্নের জন্য প্রথমে ঠিক করো:
 (ক) "numeric" — সাংখ্যিক/গাণিতিক সমস্যা, সংখ্যা বদলালে কাঠামো ঠিক রেখে নতুন প্রশ্ন হয়।
@@ -41,7 +66,11 @@ function buildIngestPrompt(rawText, hasImage, previousStems, continueFrom){
 
 "numeric" হলে:
 {"type":"numeric","stem":"বিবৃতি, $...$ দিয়ে গণিত, পরিবর্তনযোগ্য সংখ্যার জায়গায় {a},{b}..","variables":[{"name":"a","min":X,"max":Y}],"optionExprs":["সঠিক উত্তরের সূত্র","ভুল ১","ভুল ২","ভুল ৩"],"correctIndex":0,"explanation":"ধাপে ধাপে সম্পূর্ণ নির্ভুল ব্যাখ্যা"}
-সাংখ্যিক প্রশ্নে বাড়তি সতর্কতা: min ও max দুই প্রান্তেই বসিয়ে মনে মনে যাচাই করো — শূন্য দিয়ে ভাগ, ঋণাত্মক বর্গমূল, ভগ্নাংশ ফলাফল (পূর্ণসংখ্যা দরকার হলে), বা অবাস্তব মান যেন কোনো প্রান্তেই না আসে। যেমন {a}-{b} ব্যবহার করলে নিশ্চিত করো b সবসময় a-এর চেয়ে ছোট থাকে — দরকার হলে {a}+{b} আকারে সবসময়-ধনাত্মক সূত্র ব্যবহার করা সহজ। সংখ্যাগুলো ভর্তি পরীক্ষার মতোই হাতে-কলমে সহজে সমাধানযোগ্য রাখবে।
+সাংখ্যিক প্রশ্নে বাড়তি সতর্কতা (এখানে ভুল হলে পুরো প্রশ্নটাই অর্থহীন হয়ে যায়):
+- min ও max দুই প্রান্তেই বসিয়ে মনে মনে যাচাই করো — শূন্য দিয়ে ভাগ, ঋণাত্মক বর্গমূল, ভগ্নাংশ ফলাফল (পূর্ণসংখ্যা দরকার হলে), বা অবাস্তব মান যেন কোনো প্রান্তেই না আসে। যেমন {a}-{b} ব্যবহার করলে নিশ্চিত করো b সবসময় a-এর চেয়ে ছোট থাকে — দরকার হলে {a}+{b} আকারে সবসময়-ধনাত্মক সূত্র ব্যবহার করা সহজ।
+- ভেরিয়েবলের রেঞ্জ যথেষ্ট চওড়া রাখবে (প্রতিটিতে অন্তত ১০-১৫টি সম্ভাব্য পূর্ণসংখ্যা মান থাকা ভালো) — এই একটা প্যাটার্ন থেকে ভবিষ্যতে পরীক্ষায় বহুবার আলাদা আলাদা কপি তৈরি হবে, তাই রেঞ্জ সরু হলে বারবার একই সংখ্যা চলে আসতে পারে।
+- সংখ্যাগুলো ভর্তি পরীক্ষার মতোই হাতে-কলমে সহজে সমাধানযোগ্য রাখবে।
+- "explanation"-ও অবশ্যই stem-এর মতোই {a},{b}.. প্লেসহোল্ডার ব্যবহার করে জেনেরিকভাবে লিখবে (নির্দিষ্ট সংখ্যা যেমন সরাসরি "3" নয়, বরং "{a}") — কারণ পরীক্ষার সময় প্রতিবার ভিন্ন সংখ্যা বসবে, তাই ব্যাখ্যাও সেই একই ভেরিয়েবল দিয়ে লেখা থাকলে তবেই প্রতিবার সঠিক থাকবে।
 
 "concept" হলে:
 {"type":"concept","stem":"সম্পূর্ণ বিবৃতি","options":["...","...","...","..."],"correctIndex":0,"explanation":"ধাপে ধাপে সম্পূর্ণ নির্ভুল ব্যাখ্যা"}
@@ -72,7 +101,7 @@ function openIngestModal(chapterId){
 
   openModal(`
     <h3>নতুন প্রশ্ন যোগ করো (AI)</h3>
-    <p class="hint" style="margin-bottom:10px;">একটা প্রশ্ন লেখো, একসাথে অনেক প্রশ্ন পেস্ট করো, কাঁচা নোট দাও, ছবি তুলে/পেস্ট করে দাও — সাথে চাইলে নির্দেশনাও লেখো (যেমন "শুধু ১,৩,৪ নম্বর নাও")।</p>
+    <p class="hint" style="margin-bottom:10px;">একটা প্রশ্ন লেখো, একসাথে অনেক প্রশ্ন পেস্ট করো, কাঁচা নোট দাও, ছবি তুলে/পেস্ট করে দাও — সাথে চাইলে নির্দিষ্ট নির্দেশনাও লেখো (যেমন "শুধু ১,৩,৪ নম্বর নাও")।</p>
     <div class="unified-input">
       <div id="attach-preview" class="attach-preview" style="display:none;">
         <img id="attach-thumb" src="">
@@ -196,7 +225,7 @@ function openNumericEditForm(chapterId, q){
     <div class="field"><label>অপশন (সূত্র আকারে) — সঠিক উত্তরে বাটন চাপুন</label>
       <div id="opt-rows">${opts.map((o,i)=>optRow(o,i,i===correctIndex)).join('')}</div>
     </div>
-    <div class="field"><label>ব্যাখ্যা (ঐচ্ছিক)</label><textarea id="tpl-expl">${esc(q.explanation||'')}</textarea></div>
+    <div class="field"><label>ব্যাখ্যা ({a},{b} প্লেসহোল্ডার ব্যবহার করুন, ঐচ্ছিক)</label><textarea id="tpl-expl">${esc(q.explanation||'')}</textarea></div>
     <div class="btn-row">
       <button class="btn btn-primary" onclick="saveNumericEdit('${chapterId}','${q.id}')">সংরক্ষণ করুন</button>
       <button class="btn" onclick="closeModal()">বাতিল</button>
@@ -253,6 +282,7 @@ async function runIngest(){
   btn.disabled = true; const prevLabel = btn.textContent;
   ingestBusy = true;
 
+  const hasExplicit = detectsExplicitInstruction(rawText);
   let totalAdded = 0, round = 0, continueFrom = '';
   const previousStems = [];
   const MAX_ROUNDS = 15;
@@ -284,9 +314,18 @@ async function runIngest(){
         const c1 = document.getElementById('quick-add-count'); if(c1) c1.textContent = quickAddCount;
       }
       continueFrom = data.continueFrom || '';
-      // We do NOT trust the model's own "hasMore" flag to stop early — keep going until a round
-      // genuinely yields nothing new (real end of content, or model is just repeating itself).
-      if(addedThisRound===0) break;
+      const modelSaysDone = data.hasMore === false;
+
+      if(hasExplicit){
+        // The user asked for something specific (a count, specific numbers, marked items).
+        // Stop the instant the model says it's satisfied, or the instant nothing new comes
+        // back — NEVER keep inventing extra questions beyond what was actually requested.
+        if(modelSaysDone || addedThisRound===0) break;
+      } else {
+        // Plain bulk paste — don't trust a premature "done" claim, only stop on genuine
+        // exhaustion (a round that adds nothing new).
+        if(addedThisRound===0) break;
+      }
     }
     if(totalAdded===0) toast('AI কোনো নতুন প্রশ্ন শনাক্ত করতে পারেনি, আরেকটু স্পষ্ট করে দাও');
     else {
@@ -302,6 +341,23 @@ async function runIngest(){
     btn.disabled = false; btn.textContent = prevLabel;
     ingestBusy = false;
   }
+}
+
+/* ---- duplicate cleanup (for chapters that already accumulated repeats before this fix) ---- */
+async function dedupeChapterQuestions(chapterId){
+  const seen = new Set();
+  let removed = 0;
+  DB.questions = DB.questions.filter(q=>{
+    if(q.chapterId!==chapterId) return true;
+    const sig = normalizeSig(q.stem);
+    if(sig && seen.has(sig)){ removed++; return false; }
+    if(sig) seen.add(sig);
+    return true;
+  });
+  await saveQuestions();
+  toast(removed>0 ? `✅ ${removed} টি ডুপ্লিকেট মুছে ফেলা হয়েছে` : 'কোনো ডুপ্লিকেট পাওয়া যায়নি');
+  const view = document.getElementById('view');
+  if(view) view.innerHTML = viewQuestionList(chapterId);
 }
 
 /* ---- unified input helpers ---- */
