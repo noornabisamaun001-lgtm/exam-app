@@ -8,6 +8,11 @@
    duplicate-avoidance/fallback strategy), you only need to replace THIS
    file.
 
+   Hard rule throughout this file: NEVER insert a literal duplicate
+   question into an exam. If nothing unique can be produced for a slot
+   (AI failed AND the dataset has nothing unused left), that slot is
+   skipped — the exam ends up with fewer questions rather than a repeat.
+
    Depends on (from core.js): shuffleArr, shuffleOptionsArr, normalizeSig,
      runWithConcurrency, toast
    Depends on (from gemini-model.js): callGeminiAPI
@@ -15,7 +20,8 @@
 
    Exposes to the rest of the app (used by beginExam() in index.html):
      buildNeedItems(pool, n), buildChunks(items), makePushInto(target, usedSig),
-     generateNumericInstant(item), runConceptChunks(chunks, pushFn, conceptPoolAll, usedSig),
+     generateNumericInstant(item) [may return null — caller must handle that],
+     runConceptChunks(chunks, pushFn, conceptPoolAll, usedSig),
      runConceptGenerationInBackground(queue, usedSig, conceptPoolAll),
      resetExamSkipCounter(), fallbackFromConcept(item)
    Also defines (used by the exam-runner UI in index.html):
@@ -24,13 +30,16 @@
 
 // Counts how many exam slots had to be silently dropped because neither AI
 // nor the saved dataset had anything left that was still unique. Reset at
-// the start of every beginExam() call; reported once background generation
-// finishes (see finishConceptLoading below).
+// the start of every beginExam() call; reported once generation finishes.
 let examSkippedCount = 0;
 function resetExamSkipCounter(){ examSkippedCount = 0; }
 
-/* ---------------- NUMERIC ENGINE (instant, offline, never saved) ---------------- */
-function subst(text, values){ return text.replace(/\{(\w+)\}/g, (m,k)=> values[k]!==undefined ? values[k] : m); }
+/* ---------------- NUMERIC ENGINE (instant, offline, never saved) ----------------
+   Both the stem AND the explanation use the same {a},{b}.. placeholders and get
+   the SAME substitution — otherwise a written-out explanation anchored to the
+   original example numbers would silently mismatch whatever fresh numbers this
+   particular exam instance actually got. */
+function subst(text, values){ return (text||'').replace(/\{(\w+)\}/g, (m,k)=> values[k]!==undefined ? values[k] : m); }
 function safeEval(expr){
   try{
     const v = math.evaluate(expr);
@@ -45,8 +54,9 @@ function generateNumericInstant(it){
     const uniqueVals = new Set(values.map(v=>v.toString()));
     if(uniqueVals.size !== values.length) return null;
     const stemText = subst(it.stem, scope);
+    const explanationText = subst(it.explanation||'', scope);
     const {options, correctIndex} = shuffleOptionsArr(values.map(v=>String(v)), it.correctIndex);
-    return { chapterId: it.chapterId, stem: stemText, options, correctIndex, explanation: it.explanation||'' };
+    return { chapterId: it.chapterId, stem: stemText, options, correctIndex, explanation: explanationText };
   };
   for(let attempt=0; attempt<40; attempt++){
     const scope = {};
@@ -54,9 +64,12 @@ function generateNumericInstant(it){
     const r = tryOnce(scope);
     if(r) return r;
   }
+  // Last resort: try the midpoint of every range once more. If even THAT can't
+  // produce valid options, give up and return null — a missing question slot is
+  // better than showing broken/blank options to the student.
   const scope = {};
   (it.variables||[]).forEach(v=>{ scope[v.name] = Math.round((v.min+v.max)/2); });
-  return tryOnce(scope) || { chapterId: it.chapterId, stem: subst(it.stem,scope), options: it.optionExprs.map(e=>{const v=safeEval(subst(e,scope)); return v===null?'—':String(v);}), correctIndex: it.correctIndex, explanation: it.explanation||'' };
+  return tryOnce(scope);
 }
 
 /* ---------------- CONCEPT: fallback helpers (no AI available / AI failed) ---------------- */
@@ -80,12 +93,13 @@ function buildExamGenPrompt(items){
   return `তুমি একজন বাংলাদেশের ভর্তি পরীক্ষা প্রস্তুতি বিশেষজ্ঞ AI। নিচে কিছু মূল ধারণাভিত্তিক MCQ দেওয়া হলো — প্রতিটির সাথে "need" সংখ্যা আছে, ঠিক ততগুলো সম্পূর্ণ নতুন, সতেজ ভ্যারিয়েশন বানাতে হবে।
 
 নিয়মাবলী:
-- প্রসঙ্গ/উদাহরণ/শব্দচয়ন বদলে দাও, মূল ধারণা অক্ষুণ্ণ রেখে।
-- একই "id"-এর একাধিক ভ্যারিয়েশন চাইলে সেগুলো একে অপরের থেকেও সম্পূর্ণ ভিন্ন হতে হবে। পুরো তালিকার কোনো দুটি আইটেমই একে অপরের সাথে হুবহু বা প্রায় হুবহু মিলবে না।
+- প্রসঙ্গ/উদাহরণ/শব্দচয়ন বদলে দাও, মূল ধারণা অক্ষুণ্ণ রেখে। সব প্রশ্নেই ভাষা আমূল বদলানো জরুরি না — অন্তত সংখ্যা/নাম/প্রসঙ্গ কিছুটা বদলালেই যথেষ্ট, আসল লক্ষ্য হলো কোনো দুটো প্রশ্ন যেন হুবহু এক না হয়।
+- একই "id"-এর একাধিক ভ্যারিয়েশন চাইলে সেগুলো একে অপরের থেকেও ভিন্ন হতে হবে। পুরো তালিকার কোনো দুটি আইটেমই একে অপরের সাথে হুবহু মিলবে না।
 - মূল প্রশ্ন কোনো চিত্র/figure-নির্ভর হলে প্রয়োজনীয় মান লেখাতেই বর্ণনা করে দাও।
 - গাণিতিক রাশি লিখতে $...$ ব্যবহার করো।
-- প্রতিটি ব্যাখ্যা সম্পূর্ণ নির্ভুল, বিস্তারিত ও ধাপে ধাপে হতে হবে (কমপক্ষে ২-৩ বাক্য)।
+- প্রতিটি ব্যাখ্যা সম্পূর্ণ নির্ভুল, বিস্তারিত ও ধাপে ধাপে হতে হবে (কমপক্ষে ২-৩ বাক্য), এবং অবশ্যই সেই নির্দিষ্ট ভ্যারিয়েশনের নিজের সংখ্যা/উদাহরণ ব্যবহার করে লেখা — মূল প্রশ্নের পুরনো সংখ্যা/উদাহরণ দিয়ে নয়।
 - ৪টি করে অপশন, ঠিক একটি সঠিক। মূল ভাষা (বাংলা/ইংরেজি) বজায় রাখো।
+- সংক্ষিপ্ত ও নিশ্চিত উত্তর দাও, দীর্ঘ চিন্তা-প্রক্রিয়া না দেখিয়ে সরাসরি চূড়ান্ত JSON দাও।
 
 ঠিক এই আকারে আউটপুট দাও (অন্য কিছু লিখবে না, মার্কডাউন কোড ব্লকও না):
 { "generated": [ {"sourceId":"...", "stem":"...", "options":["...","...","...","..."], "correctIndex":0, "explanation":"..."} ] }
@@ -108,10 +122,12 @@ function buildNeedItems(pool, n){
   const needItems = [...needMap.entries()].map(([id,need])=>({...byId.get(id), need}));
   return { numericNeed: needItems.filter(it=>it.type==='numeric'), conceptNeed: needItems.filter(it=>it.type!=='numeric') };
 }
+// Chunks start small (max cumulative "need" of 8) — smaller requests are far less likely
+// to get truncated by an output-token limit than one giant request would be.
 function buildChunks(items){
   const chunks = []; let cur=[], curNeed=0;
   for(const it of items){
-    if(curNeed + it.need > 15 && cur.length){ chunks.push(cur); cur=[]; curNeed=0; }
+    if(curNeed + it.need > 8 && cur.length){ chunks.push(cur); cur=[]; curNeed=0; }
     cur.push(it); curNeed += it.need;
   }
   if(cur.length) chunks.push(cur);
@@ -119,6 +135,7 @@ function buildChunks(items){
 }
 function makePushInto(targetArrayOrFn, usedSig){
   return function pushQ(q, allowDup){
+    if(!q) return false;
     const s = normalizeSig(q.stem);
     if(s && usedSig.has(s) && !allowDup) return false;
     if(s) usedSig.add(s);
@@ -128,37 +145,50 @@ function makePushInto(targetArrayOrFn, usedSig){
   };
 }
 
-/* Runs one or more AI batches for concept-type need-items. For any slot the AI didn't (fully)
-   cover — a failed call, quota exhaustion, or simply fewer results than asked — falls back to
-   the SYSTEM's own saved data instead of erroring out: first the source's own question, then
-   (if that's already used) any other unused pattern from the chapter, and only as an absolute
-   last resort drops the slot (never a forced literal duplicate). */
-async function runConceptChunks(chunks, pushFn, conceptPoolAll, usedSig){
-  const tasks = chunks.map(chunk => async ()=>{
-    let gen = null;
-    try{ const data = await callGeminiAPI({text: buildExamGenPrompt(chunk)}); gen = Array.isArray(data.generated)?data.generated:[]; }
-    catch(e){ gen = null; }
-    const bySource = {};
-    if(Array.isArray(gen)) gen.forEach(g=>{ if(g && g.sourceId){ (bySource[g.sourceId]=bySource[g.sourceId]||[]).push(g); } });
-    chunk.forEach(it=>{
-      const arr = bySource[it.id] || []; let used = 0;
-      for(const g of arr){
-        if(used>=it.need) break;
-        if(!g || !g.stem || !Array.isArray(g.options) || g.options.length<2) continue;
-        let ci = Number.isInteger(g.correctIndex)?g.correctIndex:0; if(ci<0||ci>=g.options.length) ci=0;
-        const q = { chapterId: it.chapterId, stem:g.stem, options:g.options, correctIndex:ci, explanation:g.explanation||it.explanation||'' };
-        if(pushFn(q)) used++;
-      }
-      let remaining = it.need - used;
-      while(remaining > 0){
-        const own = fallbackFromConcept(it);
-        if(pushFn(own)){ remaining--; continue; }
-        const alt = pickUnusedFallback(conceptPoolAll, usedSig);
-        if(alt && pushFn(alt)){ remaining--; continue; }
-        examSkippedCount++; remaining--; // nothing unique left anywhere — skip this slot
-      }
-    });
+/* Generates one batch. If the call fails outright (network error, quota, or the JSON came back
+   truncated/unparseable), instead of giving up on the WHOLE batch we split it in half and retry
+   each half separately — a smaller request is much less likely to hit an output-length limit.
+   Bottoms out at single-item requests before finally falling back to the dataset. Any slot AI
+   still can't cover falls back to: this source's own question -> any other unused pattern in the
+   chapter -> (only if truly nothing unique is left) skipped, never duplicated. */
+async function runConceptBatch(chunk, pushFn, conceptPoolAll, usedSig, depth){
+  depth = depth || 0;
+  let gen = null;
+  try{
+    const data = await callGeminiAPI({text: buildExamGenPrompt(chunk)});
+    gen = Array.isArray(data.generated) ? data.generated : [];
+  }catch(e){ gen = null; }
+
+  if(gen === null && chunk.length > 1 && depth < 4){
+    const mid = Math.ceil(chunk.length/2);
+    await runConceptBatch(chunk.slice(0,mid), pushFn, conceptPoolAll, usedSig, depth+1);
+    await runConceptBatch(chunk.slice(mid), pushFn, conceptPoolAll, usedSig, depth+1);
+    return;
+  }
+
+  const bySource = {};
+  if(Array.isArray(gen)) gen.forEach(g=>{ if(g && g.sourceId){ (bySource[g.sourceId]=bySource[g.sourceId]||[]).push(g); } });
+  chunk.forEach(it=>{
+    const arr = bySource[it.id] || []; let used = 0;
+    for(const g of arr){
+      if(used>=it.need) break;
+      if(!g || !g.stem || !Array.isArray(g.options) || g.options.length<2) continue;
+      let ci = Number.isInteger(g.correctIndex)?g.correctIndex:0; if(ci<0||ci>=g.options.length) ci=0;
+      const q = { chapterId: it.chapterId, stem:g.stem, options:g.options, correctIndex:ci, explanation:g.explanation||it.explanation||'' };
+      if(pushFn(q)) used++;
+    }
+    let remaining = it.need - used;
+    while(remaining > 0){
+      const own = fallbackFromConcept(it);
+      if(pushFn(own)){ remaining--; continue; }
+      const alt = pickUnusedFallback(conceptPoolAll, usedSig);
+      if(alt && pushFn(alt)){ remaining--; continue; }
+      examSkippedCount++; remaining--; // nothing unique left anywhere — skip this slot, never duplicate
+    }
   });
+}
+async function runConceptChunks(chunks, pushFn, conceptPoolAll, usedSig){
+  const tasks = chunks.map(chunk => ()=> runConceptBatch(chunk, pushFn, conceptPoolAll, usedSig, 0));
   await runWithConcurrency(tasks, 3);
 }
 
