@@ -538,6 +538,7 @@ function viewQuestionList(chapterId){
     <button class="back-btn" style="margin-bottom:14px;" onclick="nav('data')">← ডেটা</button>
     <h2 class="section-title">${esc(chapter?chapter.name:'')}</h2>
     <p class="section-sub">${list.length} টি সংরক্ষিত প্রশ্ন</p>
+    ${list.length>1 ? `<div class="btn-row" style="margin-bottom:16px;"><button class="btn" onclick="dedupeChapterQuestions('${chapterId}')">🧹 ডুপ্লিকেট পরিষ্কার করো</button></div>` : ''}
     ${list.map(q=>`
       <div class="review-item">
         <span class="type-badge ${q.type==='numeric'?'type-numeric':'type-concept'}">${q.type==='numeric'?'সাংখ্যিক — তাৎক্ষণিক (বিনামূল্যে)':'ধারণাভিত্তিক — AI প্রতিবার নতুন করে বানাবে'}</span>
@@ -622,7 +623,10 @@ function toggleGroupSelect(groupId, checked){
 }
 
 /* beginExam() orchestrates exam-generation.js's building blocks — the actual generation
-   logic (numeric math engine, AI concept batching, fallback strategy) lives there. */
+   logic (numeric math engine, AI concept batching, fallback strategy) lives there.
+   Hard rule: NEVER force a duplicate into the exam. generateNumericInstant can return
+   null (couldn't produce a valid unique combination); when it does, that slot is simply
+   skipped rather than showing a broken or repeated question. */
 async function beginExam(weakChapterIds){
   let chapterIds;
   if(weakChapterIds){ chapterIds = weakChapterIds; }
@@ -645,19 +649,25 @@ async function beginExam(weakChapterIds){
   const initialQuestions = [];
   const pushInit = makePushInto(initialQuestions, usedSig);
 
-  // Numeric: instant, no network, no waiting.
+  // Numeric: instant, no network, no waiting — and NEVER a forced duplicate. If a
+  // pattern's range is too narrow to produce another unique combination, that slot
+  // is skipped (counted) rather than repeating a question.
   numericNeed.forEach(it=>{
     for(let k=0;k<it.need;k++){
       let placed = false;
-      for(let t=0; t<5 && !placed; t++){ const q = generateNumericInstant(it); if(pushInit(q, t===4)) placed = true; }
+      for(let t=0; t<6 && !placed; t++){
+        const q = generateNumericInstant(it);
+        if(q && pushInit(q)) placed = true;
+      }
+      if(!placed) examSkippedCount++;
     }
   });
 
-  // Concept: generate the FIRST batch (~15) fully and wait for it — guarantees every question
+  // Concept: generate the FIRST batch (~8) fully and wait for it — guarantees every question
   // shown at exam start (and its options) is complete and correct, no mid-exam surprises.
   const conceptQueue = [...conceptNeed];
   const firstBatch = [];
-  { let sum=0; while(conceptQueue.length && sum<15){ const it=conceptQueue.shift(); firstBatch.push(it); sum+=it.need; } }
+  { let sum=0; while(conceptQueue.length && sum<8){ const it=conceptQueue.shift(); firstBatch.push(it); sum+=it.need; } }
 
   if(firstBatch.length){
     showBatchLoading('প্রশ্ন প্রস্তুত হচ্ছে...');
