@@ -8,23 +8,28 @@
    model turns out to be retired/overloaded, it silently re-discovers or
    walks to a Google-maintained "evergreen" alias — never a hardcoded
    version string. Pro-class models are actively avoided since free-tier
-   keys typically have ZERO quota for them (this was the cause of the
-   "quota exceeded ... gemini-3.1-pro" errors).
+   keys typically have ZERO quota for them.
+
+   Also: current-generation Gemini models "think" by default before
+   answering. For structured extraction/generation tasks that eats the
+   output budget and can truncate or bury the real JSON answer under
+   reasoning text — this was the root cause of most "model just won't
+   work" failures. Every request explicitly disables thinking and asks
+   for a generous output budget; if a model doesn't support the
+   thinking toggle, we transparently retry that same request without it.
 
    Depends on (from core.js): sGet, sSet, sleep, openModal, closeModal, esc, toast
    Exposes to everyone else: callGeminiAPI({text, imageBase64, imageMime})
      -> resolves to the parsed JSON object the model returned.
      Throws Error('NO_API_KEY') if no key is set.
-     Throws an auth-style Error only when the key itself is invalid/restricted
-     (nothing else can be silently retried past that).
+     Throws an auth-style Error only when the key itself is invalid/restricted.
    Also exposes: openSettingsModal, saveSettings, redetectModel, discoverBestModel
 ===================================================================== */
 
-// The ONLY two model names ever referenced by name in this app. These are
-// NOT version-locked — Google itself keeps these pointed at whatever its
-// current best models are. "pro-latest" is deliberately excluded: Pro-class
-// models generally have no free-tier quota, so including it just produces
-// confusing "quota exceeded" failures for users on a free key.
+// The ONLY model name ever referenced literally in this app. NOT version-locked —
+// Google itself keeps this pointed at whatever its current best flash model is.
+// Pro-class is deliberately excluded (see scoreModelName): free-tier keys usually
+// have zero quota for it, which was producing confusing "quota exceeded" failures.
 const EVERGREEN_ALIASES = ['gemini-flash-latest'];
 
 function scoreModelName(name){
@@ -104,18 +109,29 @@ async function callGeminiAPI({text, imageBase64, imageMime}){
 
   const parts = [{ text }];
   if(imageBase64){ parts.push({ inline_data: { mime_type: imageMime || 'image/jpeg', data: imageBase64 } }); }
-  const body = { contents: [{ role: 'user', parts }], generationConfig: { temperature: 0.6 } };
+
+  async function fetchOnce(model, includeThinkingToggle){
+    const cfg = { temperature: 0.6, maxOutputTokens: 8192 };
+    if(includeThinkingToggle) cfg.thinkingConfig = { thinkingBudget: 0 }; // disable "thinking" — it was eating the output budget and truncating our JSON
+    const reqBody = { contents: [{ role: 'user', parts }], generationConfig: cfg };
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+    const res = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(reqBody) });
+    const data = await res.json().catch(()=>({}));
+    return { res, data };
+  }
 
   async function attempt(model){
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
-    const res = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
-    const data = await res.json().catch(()=>({}));
+    let { res, data } = await fetchOnce(model, true);
+    if(!res.ok && /thinking/i.test(data?.error?.message||'')){
+      // this model doesn't support the thinking toggle — retry the same model without it
+      ({ res, data } = await fetchOnce(model, false));
+    }
     if(!res.ok){
       const err = new Error(data?.error?.message || ('HTTP '+res.status));
       err.status = res.status;
       throw err;
     }
-    // Newer "thinking" models may emit reasoning parts alongside the real answer — drop those.
+    // Drop any leftover "thinking" parts defensively — keep only the real answer text.
     const rawParts = data?.candidates?.[0]?.content?.parts || [];
     const outText = rawParts.filter(p=>!p.thought).map(p=>p.text||'').join('');
     if(!outText) throw new Error('EMPTY_RESPONSE');
@@ -170,7 +186,7 @@ async function openSettingsModal(){
     <div class="field"><label>API Key</label><input id="set-api-key" type="password" value="${esc(key)}" placeholder="AIza..."></div>
     <div class="field"><label>মডেল</label>
       <input id="set-model" type="text" value="${esc(model)}" placeholder="auto">
-      <div class="hint">"auto" রাখলে অ্যাপ প্রতিবার key দিয়ে জিজ্ঞেস করে দেখে নেয় এই মুহূর্তে কোন Gemini মডেল সচল আছে এবং ফ্রি-টিয়ারে ব্যবহারযোগ্য (Pro-ক্লাস মডেল এড়িয়ে চলে), এবং সেটাই ব্যবহার করে — কোনো নির্দিষ্ট মডেলের নাম কোডে বসানো নেই।</div>
+      <div class="hint">"auto" রাখলে অ্যাপ প্রতিবার key দিয়ে জিজ্ঞেস করে দেখে নেয় এই মুহূর্তে কোন Gemini মডেল সচল আছে এবং ফ্রি-টিয়ারে ব্যবহারযোগ্য (Pro-ক্লাস মডেল এড়িয়ে চলে), এবং সেটাই ব্যবহার করে।</div>
       <div class="hint" style="margin-top:8px;">শেষ ব্যবহৃত মডেল: <b>${cache && cache.model ? esc(cache.model) : 'এখনো সনাক্ত হয়নি'}</b> · <button type="button" class="link-btn" onclick="redetectModel()">পুনরায় সনাক্ত করো</button></div>
     </div>
     <div class="btn-row">
