@@ -13,6 +13,14 @@ function egInt(a,b){a=Math.ceil(Number(a));b=Math.floor(Number(b));return Number
 function egScope(it){const s={};for(const v of it.variables||[]){const n=egInt(v.min,v.max);if(n===null)return null;s[v.name]=n}return s}
 function egSig(q){return String(q.stem||'').toLowerCase().replace(/\s+/g,'').replace(/[^\u0980-\u09ffa-z0-9]/g,'')+'||'+(q.options||[]).map(x=>String(x).toLowerCase().replace(/\s+/g,'')).join('|')}
 function egPush(target,q,used){if(!q)return false;const s=egSig(q);if(!s||used.has(s))return false;used.add(s);target(q);return true}
+/* makePushInto — glue function that was missing entirely. beginExam() in
+   index.html calls `makePushInto(initialQuestions, usedSig)` and expects back
+   a single-argument function it can call as `pushInit(q)`. Without this,
+   beginExam() threw ReferenceError the instant "পরীক্ষা শুরু করুন" was clicked
+   and the exam could never start. Wraps egPush around a plain array push. */
+function makePushInto(arr, usedSig){
+  return function(q){ return egPush(item=>arr.push(item), q, usedSig); };
+}
 function egFour(a){return Array.isArray(a)&&a.length===4&&a.every(x=>String(x).trim())&&new Set(a.map(x=>String(x).trim().toLowerCase())).size===4}
 function generateNumericInstant(it,usedSig){
   for(let k=0;k<160;k++){
@@ -46,12 +54,12 @@ function buildExamGenPrompt(items){
 প্রতিটি source-এর মূল concept, required knowledge, solving method, difficulty ও answer logic অপরিবর্তিত রাখবে। শুধু controlled wording/context/numerical/figure variation করবে।
 নতুন topic, fact, chapter বা শেখানোর প্রশ্ন যোগ করবে না।
 একই source-এর দুই variation একে অপরের duplicate হতে পারবে না।
-Math equation সবসময় $...$-এ লিখবে।
-Figure হলে প্রয়োজনীয় relation/value text-এ সম্পূর্ণভাবে দেবে; কল্পিত/অসম্পূর্ণ figure নয়।
+Math equation সবসময় $...$-এ লিখবে।
+Figure হলে প্রয়োজনীয় relation/value text-এ সম্পূর্ণভাবে দেবে; কল্পিত/অসম্পূর্ণ figure নয়।
 প্রতিটি প্রশ্নে ঠিক 4টি distinct option এবং exactly 1 correct option থাকবে।
 correctIndex option shuffle-এর পরের অবস্থান নির্দেশ করবে এবং 0-3 হবে।
 Fixed factual answer বদলাবে না।
-প্রতিটি explanation generated question-এর নিজের values/logic অনুযায়ী হবে।
+প্রতিটি explanation generated question-এর নিজের values/logic অনুযায়ী হবে।
 প্রতিটি output নিজে যাচাই করে তবেই দেবে।
 শুধু JSON:
 {"generated":[{"sourceId":"...","stem":"...","options":["...","...","...","..."],"correctIndex":0,"explanation":"..."}]}
@@ -92,4 +100,3 @@ function finishConceptLoading(){
   document.getElementById('loading-more-indicator')?.remove();
   if(examSkippedCount)toast(`⚠ ${examSkippedCount}টি বৈধ variation তৈরি করা যায়নি; ভুল/duplicate প্রশ্ন দেখানো হয়নি`);
 }
-
