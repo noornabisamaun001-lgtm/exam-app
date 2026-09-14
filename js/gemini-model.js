@@ -18,6 +18,13 @@
    for a generous output budget; if a model doesn't support the
    thinking toggle, we transparently retry that same request without it.
 
+   ONE-LINE CHANGE (this revision): maxOutputTokens raised from 8192 to
+   32768. This is NOT the daily free-tier call quota (that's a completely
+   separate Google-side limit and is untouched by this file) — it's just
+   how long a SINGLE response is allowed to be. 8192 was cutting off large
+   ingestion extractions (e.g. a 30+ question paste) mid-JSON. Nothing
+   else in this file changed.
+
    Depends on (from core.js): sGet, sSet, sleep, openModal, closeModal, esc, toast
    Exposes to everyone else: callGeminiAPI({text, imageBase64, imageMime})
      -> resolves to the parsed JSON object the model returned.
@@ -111,7 +118,7 @@ async function callGeminiAPI({text, imageBase64, imageMime}){
   if(imageBase64){ parts.push({ inline_data: { mime_type: imageMime || 'image/jpeg', data: imageBase64 } }); }
 
   async function fetchOnce(model, includeThinkingToggle){
-    const cfg = { temperature: 0.6, maxOutputTokens: 8192 };
+    const cfg = { temperature: 0.6, maxOutputTokens: 32768 };
     if(includeThinkingToggle) cfg.thinkingConfig = { thinkingBudget: 0 }; // disable "thinking" — it was eating the output budget and truncating our JSON
     const reqBody = { contents: [{ role: 'user', parts }], generationConfig: cfg };
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
