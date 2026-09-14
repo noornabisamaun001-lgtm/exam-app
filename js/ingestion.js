@@ -1,16 +1,22 @@
 /* ingestion.js — question input / ingestion / save
 
-   Two real bugs fixed this round:
-   1) The JSON schema example in the prompt showed a literal `"hasMore":false`.
-      Models anchor hard on concrete example values in a schema — it was
-      just echoing false every time, so a 37-question paste only ever
-      yielded whatever fit in ONE response before the loop gave up.
-      Fix: no literal boolean in the example; the rule is stated in prose,
-      and each round is deliberately capped to a small item count so a
-      big input needs (and reliably gets) multiple rounds instead of
-      silently truncating.
-   2) No way to paste an image from the clipboard (desktop) — only a file
-      picker. Added a paste handler on the input box.
+   BIGGEST CHANGE THIS ROUND: for text input (no image, no "only X,Y"
+   instruction), we no longer ask the AI to decide how much of a long
+   paste it has covered. That was fundamentally unreliable — a 37-line
+   paste kept coming back with "hasMore: false" after extracting a
+   handful of items.
+
+   Instead: the CODE deterministically splits the raw text into small
+   chunks (by line count AND character length, so one giant crammed-
+   together line still gets split safely) and sends EVERY chunk as its
+   own API call. The loop is driven by "how many chunks do we have left",
+   not by anything the model reports — so nothing can be silently
+   dropped because the model was overconfident about being done.
+
+   An attached image (or an explicit "only 3,7" style instruction) can't
+   be chunked this way, so those still use a bounded multi-round loop
+   that relies on the model's own hasMore signal — best effort, but that
+   path is now the exception, not the default.
 
    Dependencies: core.js, gemini-model.js
 */
@@ -38,10 +44,6 @@ function ingestSimilarity(a,b){
   let n=0; A.forEach(x=>B.has(x)&&n++);
   return n / Math.max(1, new Set([...A,...B]).size);
 }
-/* A question only counts as a duplicate against questions ALREADY SAVED
-   in the SAME chapter — that's the actual "data sheet" the exam draws
-   from, so this is what prevents one pattern from silently existing
-   twice and doubling up inside generated exams. */
 function ingestNearDuplicate(stem, existingInChapter){
   const s = canonIngest(stem);
   if(!s) return true;
@@ -56,31 +58,70 @@ function explicitSelection(s=''){
     /(?:নম্বর|no\.?|question)\s*[০-৯0-9]+(?:\s*[,ও&]\s*[০-৯0-9]+)+/i.test(s);
 }
 
-/* ---------------- prompt ---------------- */
-/* Each round asks for a SMALL, bounded batch on purpose — a big page/paste
-   with 30-40 questions must never be attempted in one response (that's what
-   was silently truncating output). The round loop in runIngest() keeps
-   calling this until hasMore comes back false or the round cap is hit. */
-const INGEST_BATCH_CAP = 12;
+/* ---------------- deterministic text chunking ---------------- */
+const INGEST_MAX_LINES_PER_CHUNK = 12;
+const INGEST_MAX_CHARS_PER_CHUNK = 900;
 
-function buildIngestPrompt(raw='', previous=[]){
+/* Splits raw text into small, independent pieces we can each send as one
+   API call. Handles two real-world messes: (a) a huge number of short
+   lines, and (b) several questions crammed onto ONE very long line with
+   no newline between them (exactly what showed up in the reported case) —
+   any line longer than the char budget gets further sliced, preferring a
+   space boundary so we don't cut a word/formula in half. */
+function splitRawTextIntoChunks(raw){
+  const rawLines = raw.split('\n');
+  const lines = [];
+  for(const line of rawLines){
+    if(line.length <= INGEST_MAX_CHARS_PER_CHUNK){ lines.push(line); continue; }
+    let start = 0;
+    while(start < line.length){
+      let end = Math.min(start + INGEST_MAX_CHARS_PER_CHUNK, line.length);
+      if(end < line.length){
+        const spaceIdx = line.lastIndexOf(' ', end);
+        if(spaceIdx > start + 100) end = spaceIdx;
+      }
+      lines.push(line.slice(start, end));
+      start = end;
+    }
+  }
+
+  const chunks = [];
+  let cur = [], curChars = 0;
+  for(const line of lines){
+    if(cur.length && (cur.length >= INGEST_MAX_LINES_PER_CHUNK || curChars + line.length > INGEST_MAX_CHARS_PER_CHUNK)){
+      chunks.push(cur.join('\n'));
+      cur = []; curChars = 0;
+    }
+    cur.push(line);
+    curChars += line.length + 1;
+  }
+  if(cur.length) chunks.push(cur.join('\n'));
+  return chunks.length ? chunks : [raw];
+}
+
+/* ---------------- prompt ---------------- */
+/* batchCap: for the bounded round-loop path (image / selective instruction)
+   we still cap items per call so a single dense image can't blow the
+   output budget. For the deterministic chunk path, batchCap is null —
+   each chunk is already small, so we just ask for everything in it. */
+function buildIngestPrompt(raw='', previous=[], batchCap=null){
   const selective = explicitSelection(raw);
-  const prevList = previous.slice(-50); // keep the prompt from ballooning over many rounds
+  const prevList = previous.slice(-50);
   const prev = prevList.length
     ? `\nএই stem গুলো ইতিমধ্যে নেওয়া হয়েছে — এগুলো আবার দিও না:\n${prevList.map((x,i)=>`${i+1}. ${x}`).join('\n')}`
     : '';
+  const capLine = batchCap
+    ? `এই দফায় সর্বোচ্চ ${batchCap}টি item দিবে। ইনপুটে এর বাইরেও আরও বৈধ, না-নেওয়া কন্টেন্ট বাকি থাকলে "hasMore": true দিবে, নাহলে false।`
+    : `এটা ইনপুটের একটা ছোট অংশ — এখানে যতগুলো বৈধ প্রশ্ন/তথ্য আছে সবগুলো থেকেই item বানাবে, সংখ্যার কোনো সীমা নেই।`;
+
   return `তুমি একটি নির্ভুল প্রশ্ন-ব্যাংক এক্সট্র্যাকশন ইঞ্জিন। ইনপুটে ছবি এবং/অথবা টেক্সট থাকতে পারে।
 
 সিদ্ধান্তের নিয়ম:
-১) ছবিতে মার্ক/সার্কেল/হাইলাইট থাকলে অথবা টেক্সটে নির্দিষ্ট কিছু বেছে দেওয়া থাকলে (যেমন: "শুধু ৩,৭ নাও", "শুধু দাগানোগুলো") — তাহলে কেবল সেই নির্দিষ্ট অংশগুলোই নাও, বাকি সব বাদ দাও।
-২) এমন কোনো নির্দিষ্ট নির্দেশনা/মার্কিং না থাকলে — ইনপুটে যত বৈধ প্রশ্ন/তথ্য আছে সবগুলোই ধরে নাও প্রয়োজন। এটাই স্বাভাবিক আচরণ।
+১) ছবিতে মার্ক/সার্কেল/হাইলাইট থাকলে অথবা টেক্সটে নির্দিষ্ট কিছু বেছে দেওয়া থাকলে (যেমন: "শুধু ৩,৭ নাও") — তাহলে কেবল সেই নির্দিষ্ট অংশগুলোই নাও।
+২) এমন কোনো নির্দিষ্ট নির্দেশনা/মার্কিং না থাকলে — ইনপুটে যত বৈধ প্রশ্ন/তথ্য আছে সবগুলোই ধরে নাও প্রয়োজন।
 ${selective ? '\n→ এই ইনপুটে স্পষ্ট নির্বাচন-নির্দেশনা আছে, তাই নিয়ম ১ প্রযোজ্য।' : '\n→ এই ইনপুটে কোনো নির্বাচন-নির্দেশনা নেই, তাই নিয়ম ২ প্রযোজ্য।'}
 
-এই দফায় (batch) সর্বোচ্চ ${INGEST_BATCH_CAP}টি item দিবে — এর বেশি থাকলেও এখন সবগুলো দেওয়ার দরকার নেই।
-"hasMore" ফিল্ডের নিয়ম (গুরুত্বপূর্ণ):
-- ইনপুটে (ছবি/টেক্সটে) যদি এই ${INGEST_BATCH_CAP}টার বাইরেও আরও বৈধ, না-নেওয়া প্রশ্ন/তথ্য অবশিষ্ট থাকে → "hasMore": true দিবে।
-- ইনপুটের সবটুকু বৈধ কনটেন্ট এই দফাতেই কভার হয়ে গেলে, বা আর কিছু অবশিষ্ট না থাকলে → "hasMore": false দিবে।
-- এই মান তুমি ইনপুট নিজে পরীক্ষা করে ঠিক করবে, কোনো ডিফল্ট বা অনুমান করে বসাবে না।
+${capLine}
 
 প্রতিটি item তৈরির সময়:
 - মূল concept, সমাধান পদ্ধতি ও উত্তরের যুক্তি হুবহু বজায় রাখবে। raw textbook lines/তথ্য হলে শুধু সেই নির্দিষ্ট তথ্য থেকেই MCQ বানাবে — বাইরের জ্ঞান/নতুন topic আনবে না।
@@ -92,8 +133,8 @@ ${selective ? '\n→ এই ইনপুটে স্পষ্ট নির্�
 - শুধু নিচের ফরম্যাটে বৈধ JSON রিটার্ন করবে, অন্য কোনো টেক্সট/মার্কডাউন না।
 ${prev}
 
-JSON ফরম্যাট (hasMore-এর মান উপরের নিয়ম অনুযায়ী তুমি বসাবে, উদাহরণে যা দেখানো হয়েছে সেটা শুধু গঠন বোঝানোর জন্য):
-{"items":[{"type":"concept","stem":"...","options":["...","...","...","..."],"correctIndex":0,"explanation":"..."},{"type":"numeric","stem":"... {a} ...","variables":[{"name":"a","min":5,"max":25}],"optionExprs":["...","...","...","..."],"correctIndex":0,"explanation":"... {a} ..."}],"hasMore":"true অথবা false, নিয়ম অনুযায়ী"}
+JSON ফরম্যাট (উদাহরণ শুধু গঠন বোঝানোর জন্য):
+{"items":[{"type":"concept","stem":"...","options":["...","...","...","..."],"correctIndex":0,"explanation":"..."},{"type":"numeric","stem":"... {a} ...","variables":[{"name":"a","min":5,"max":25}],"optionExprs":["...","...","...","..."],"correctIndex":0,"explanation":"... {a} ..."}],"hasMore":false}
 
 ইউজার ইনপুট:
 ${raw || '(শুধু ছবি — ছবিটা মনোযোগ দিয়ে দেখো)'}
@@ -154,6 +195,30 @@ async function dedupeChapterQuestions(chapterId){
   if(v) v.innerHTML = viewQuestionList(chapterId);
 }
 
+/* One API call + insertion. Shared by both the chunked path and the
+   bounded round-loop path. */
+async function ingestOneRound(text, previous, batchCap){
+  let data = null;
+  try{
+    data = await callGeminiAPI({
+      text: buildIngestPrompt(text, previous, batchCap),
+      imageBase64: attachedImage?.base64,
+      imageMime: attachedImage?.mime
+    });
+  }catch(e){}
+  const items = Array.isArray(data?.items) ? data.items : [];
+  let added = 0;
+  const newStems = [];
+  for(const it of items){
+    if(await insertQuestionFromItem(currentIngestChapterId, it)){
+      added++;
+      newStems.push(cleanIngestText(it.stem).slice(0,180));
+    }
+  }
+  if(added) await saveQuestions();
+  return { added, hasMore: data?.hasMore, newStems };
+}
+
 /* ---------------- run ingestion ---------------- */
 async function runIngest(){
   const el = document.getElementById('ai-raw-text');
@@ -166,39 +231,35 @@ async function runIngest(){
   const btn = document.getElementById('ai-parse-btn');
   if(btn) btn.disabled = true;
 
-  let total=0, round=0, previous=[];
+  let total = 0;
   const selective = explicitSelection(raw);
   try{
-    // A selective request ("শুধু ৩,৭") needs exactly one pass — looping
-    // again would risk the model reinterpreting and adding extras.
-    // A bulk/whole-input request may span many small batches (see
-    // INGEST_BATCH_CAP) — bounded high enough that a 40-50 question
-    // paste still finishes automatically without the user re-clicking.
-    const maxRounds = selective ? 1 : 20;
-    while(round++ < maxRounds){
-      let data = null;
-      try{
-        data = await callGeminiAPI({
-          text: buildIngestPrompt(raw, previous),
-          imageBase64: attachedImage?.base64,
-          imageMime: attachedImage?.mime
-        });
-      }catch(e){}
-      const items = Array.isArray(data?.items) ? data.items : [];
-      let added = 0;
-      for(const it of items){
-        if(await insertQuestionFromItem(currentIngestChapterId, it)){
-          added++; total++;
-          previous.push(cleanIngestText(it.stem).slice(0,180));
-        }
+    if(attachedImage || selective){
+      // Can't deterministically chunk an image, and a selective ("only
+      // 3,7") instruction needs the full context together — bounded
+      // multi-round loop, capped batch size, relying on the model's own
+      // hasMore signal (best effort).
+      let previous = [];
+      const maxRounds = selective ? 1 : 6;
+      for(let r=0; r<maxRounds; r++){
+        const { added, hasMore, newStems } = await ingestOneRound(raw, previous, 12);
+        total += added;
+        previous.push(...newStems);
+        updateIngestProgress(total);
+        if(!added || hasMore===false) break;
       }
-      if(added) await saveQuestions();
-      if(updateIngestProgress) updateIngestProgress(total);
-      // Stop only when the model explicitly says nothing is left, or a
-      // round produced literally nothing usable (avoids spinning forever
-      // on a bad response).
-      if(!added || data?.hasMore===false) break;
+    } else {
+      // Bulk text, no selection instruction: WE split it ourselves and
+      // process every piece — this is what guarantees nothing gets
+      // silently dropped on a long paste.
+      const chunks = raw ? splitRawTextIntoChunks(raw) : [''];
+      for(let ci=0; ci<chunks.length; ci++){
+        const { added } = await ingestOneRound(chunks[ci], []);
+        total += added;
+        updateIngestProgress(total, chunks.length, ci+1);
+      }
     }
+
     if(total){
       if(el){ el.value=''; autoGrowInput(el); }
       clearAttachment();
@@ -216,20 +277,19 @@ async function runIngest(){
 }
 
 /* =====================================================================
-   INGEST MODAL — text + image input (file picker AND clipboard paste),
-   uses the app's existing .unified-input / #ai-raw-text / .attach-preview
-   / .input-icon-btn / .input-send-btn styling.
+   INGEST MODAL — text + image input (file picker AND clipboard paste)
 ===================================================================== */
 function openIngestModal(chapterId){
   currentIngestChapterId = chapterId;
   attachedImage = null;
-  ingestSeenSigs = new Set(); // fresh per session — one chapter's sigs must never block another's
+  ingestSeenSigs = new Set();
 
   openModal(`
     <h3>প্রশ্ন যোগ করো (AI)</h3>
     <p class="hint" style="margin-bottom:12px;">
       ছবি দাও (আপলোড বাটনে অথবা সরাসরি <b>Ctrl+V</b> দিয়ে paste করো), বা টেক্সট লেখো।
       নির্দিষ্ট কিছু চাইলে লিখে দাও (যেমন: "শুধু ৩, ৭ নাও") — কিছু না লিখলে ইনপুটে যা আছে সবটাই যোগ হবে।
+      বড় টেক্সট নিজে থেকেই ছোট ছোট অংশে ভাগ করে একে একে প্রসেস হবে।
     </p>
     <div class="unified-input">
       <div id="attach-preview-wrap"></div>
@@ -290,7 +350,6 @@ function handleIngestPaste(e){
       return;
     }
   }
-  // no image on clipboard — let normal text paste happen
 }
 function renderAttachPreview(){
   const wrap = document.getElementById('attach-preview-wrap');
@@ -306,9 +365,14 @@ function clearAttachment(){
   const wrap = document.getElementById('attach-preview-wrap');
   if(wrap) wrap.innerHTML = '';
 }
-function updateIngestProgress(totalSoFar){
+function updateIngestProgress(totalSoFar, totalChunks, currentChunk){
   const el = document.getElementById('ingest-progress');
-  if(el) el.textContent = totalSoFar ? `এখন পর্যন্ত ${totalSoFar}টি প্রশ্ন সংরক্ষিত হয়েছে, চলছে...` : 'পড়া হচ্ছে...';
+  if(!el) return;
+  if(totalChunks && totalChunks>1){
+    el.textContent = `অংশ ${currentChunk||0}/${totalChunks} প্রসেস হচ্ছে — এখন পর্যন্ত ${totalSoFar}টি প্রশ্ন সংরক্ষিত হয়েছে...`;
+  } else {
+    el.textContent = totalSoFar ? `এখন পর্যন্ত ${totalSoFar}টি প্রশ্ন সংরক্ষিত হয়েছে...` : 'পড়া হচ্ছে...';
+  }
 }
 function hideIngestProgress(){
   const el = document.getElementById('ingest-progress');
