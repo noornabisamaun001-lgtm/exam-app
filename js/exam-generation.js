@@ -1,31 +1,31 @@
 /* exam-generation.js — exam question generation from saved core questions
 
-   CORE IDEA: the student saves N core questions per chapter; an exam of
-   size M draws from that pool, repeating patterns as needed via
-   controlled variation — but two questions from the SAME core pattern
-   must never land back-to-back, and generated variations must be
-   genuinely different from each other, not trivial algebraic flips.
+   NEW THIS ROUND: previously, once a source pattern ran out of unique
+   variations (retries exhausted), that slot was just SKIPPED — the
+   requested total (e.g. 100) permanently fell short (e.g. 33), and
+   whichever single pattern kept succeeding ended up dominating the tail
+   of the exam, which looked like "everything after Q17 is basically the
+   same question".
 
-   Two things fixed this round (on top of the earlier interleaving fix):
-   1) Variations were too similar to each other (e.g. "(1+i)/(1-i)" then
-      later "(1-i)/(1+i)" — a trivial flip, not a real new variation).
-      Fix: each source pattern now carries a running history of stems
-      already generated for it THIS EXAM, sent back to the AI as an
-      explicit "avoid repeating these" list, plus a direct instruction
-      that swapping signs/reciprocals/order is not a valid variation.
-   2) Large exams (e.g. 200 questions) fell short of the target when the
-      core-question pool was small, because each source pattern had to
-      produce many unique variations and kept losing to the duplicate
-      check. Retry depth bumped 2 -> 3 to recover more of the shortfall.
-      (This is fundamentally limited by pool size — a 5-6 question pool
-      cannot realistically yield 200 truly unique variations; more core
-      questions is the real fix for very large exams.)
+   Fix: a source that truly runs out gets marked EXHAUSTED (so we stop
+   wasting calls on it), and a REFILL PASS then redistributes the
+   shortfall across the OTHER, still-viable patterns in the pool — up to
+   several extra rounds — instead of just accepting the shortfall. Only
+   when the entire pool is exhausted does the exam actually fall short,
+   and that's reported honestly via examSkippedCount.
+
+   Also carried over from before: round-robin interleaving (buildNeedItems)
+   so the same pattern doesn't cluster, and per-source generation history
+   sent to the AI so it stops producing trivial sign-flip/reciprocal
+   "variations" of the same question.
 */
 let examSkippedCount=0;
 let sourceVariationHistory=new Map(); // sourceId -> stems already generated this exam
+let exhaustedSources=new Set();       // sourceIds that produced 0 more valid variations after full retry
 function resetExamSkipCounter(){
   examSkippedCount=0;
   sourceVariationHistory=new Map();
+  exhaustedSources=new Set();
 }
 
 /* ---------------- numeric math engine ---------------- */
@@ -56,7 +56,6 @@ function egPush(target,q,used){
   if(!s || used.has(s)) return false;
   used.add(s); target(q); return true;
 }
-/* Wraps egPush around a plain array so calling code just gets pushFn(q). */
 function makePushInto(arr, usedSig){
   return function(q){ return egPush(item=>arr.push(item), q, usedSig); };
 }
@@ -80,12 +79,10 @@ function generateNumericInstant(it, usedSig){
   }
   return null;
 }
-/* Intentionally no literal fallback: replaying the saved stem defeats the app's purpose. */
 function fallbackFromConcept(){ return null; }
 function pickUnusedFallback(){ return null; }
 
-/* ---------------- need calculation — round-robin interleaved so the SAME
-   pattern never clusters together in the exam ---------------- */
+/* ---------------- need calculation — round-robin interleaved ---------------- */
 function buildNeedItems(pool, n){
   const p = shuffleArr([...pool]);
   if(p.length===0) return { numericNeed:[], conceptNeed:[] };
@@ -119,7 +116,6 @@ function buildChunks(items, batchSize=25){
 }
 
 function buildExamGenPrompt(items){
-  // items already carry `avoid`: stems generated for that exact source so far.
   const payload = items.map(it=>({
     id: it.id, need: it.need, stem: it.stem, options: it.options,
     correctIndex: it.correctIndex, explanation: it.explanation||'',
@@ -130,9 +126,9 @@ function buildExamGenPrompt(items){
 প্রতিটি source-এর মূল concept, required knowledge, solving method, difficulty ও answer logic অপরিবর্তিত রাখবে।
 
 VARIATION আসলেই ভিন্ন হতে হবে — এটা কঠোরভাবে মানবে:
-- শুধু sign flip করা (a+ib থেকে a-ib), fraction উল্টানো ((z-a)/(z-b) থেকে (z-b)/(z-a)), বা numerator/denominator অদল-বদল করা — এগুলো বৈধ variation না, এগুলো ব্যবহার করবে না।
+- শুধু sign flip করা, fraction উল্টানো, বা numerator/denominator অদল-বদল করা — এগুলো বৈধ variation না।
 - প্রতিটি variation-এ প্রকৃতপক্ষে ভিন্ন সংখ্যা/coefficient/জটিল সংখ্যা ব্যবহার করবে যা দিয়ে গণনা করলে ভিন্ন intermediate step লাগে, কিন্তু concept ও method একই থাকে।
-- প্রতিটি item-এর সাথে তার "avoid" তালিকা দেওয়া আছে — ঐ stem গুলোর কাছাকাছি গঠনের (structurally similar) কিছু বানাবে না, নতুন কিছু বানাবে।
+- প্রতিটি item-এর "avoid" তালিকায় যা আছে তার কাছাকাছি গঠনের কিছু বানাবে না।
 - একই source-এর দুই variation একে অপরের duplicate বা near-duplicate হতে পারবে না।
 
 Math equation সবসময় $...$-এ লিখবে।
@@ -148,12 +144,11 @@ SOURCE:
 ${JSON.stringify(payload)}`;
 }
 
-/* runConceptBatch: asks the AI efficiently (one aggregated entry per source
-   id within this chunk) but distributes/pushes results by walking the
-   ORIGINAL interleaved `chunk` order — that's what keeps same-pattern
-   questions apart in the final exam. Successful pushes are recorded into
-   sourceVariationHistory so later batches (including background ones)
-   know what to avoid repeating. */
+/* runConceptBatch: asks the AI efficiently (aggregated per source id
+   within this chunk), distributes results by walking the interleaved
+   chunk order, and — only at the deepest retry — marks a source
+   EXHAUSTED and reports back how many items it truly couldn't fill, so
+   the caller can redistribute that shortfall elsewhere. */
 async function runConceptBatch(chunk, pushFn, conceptPoolAll, usedSig, depth=0){
   const byId = new Map();
   for(const it of chunk){
@@ -195,17 +190,44 @@ async function runConceptBatch(chunk, pushFn, conceptPoolAll, usedSig, depth=0){
     if(!placed) retryList.push(it);
   }
 
-  if(retryList.length && depth<3){
-    await runConceptBatch(retryList, pushFn, conceptPoolAll, usedSig, depth+1);
-  } else if(retryList.length){
-    examSkippedCount += retryList.length;
+  if(!retryList.length) return 0;
+  if(depth<3){
+    return await runConceptBatch(retryList, pushFn, conceptPoolAll, usedSig, depth+1);
   }
+  // exhausted at max depth — this source genuinely can't give more right now
+  retryList.forEach(it=>exhaustedSources.add(it.id));
+  examSkippedCount += retryList.length;
+  return retryList.length;
 }
 async function runConceptChunks(chunks, pushFn, conceptPoolAll, usedSig){
   for(const c of chunks) await runConceptBatch(c, pushFn, conceptPoolAll, usedSig, 0);
 }
 
-/* ---------------- background generation (runs after exam has already started) ---------------- */
+/* After the normally-assigned queue is processed, if some slots came up
+   short, try to fill that same number of questions from OTHER, still-
+   viable patterns in the pool instead of just accepting the shortfall.
+   Bounded to a few extra passes so a fully-exhausted pool can't loop
+   forever. */
+async function refillShortfall(pushFn, conceptPoolAll, usedSig){
+  if(!currentExam || examSkippedCount<=0) return;
+  let attemptsLeft = 4;
+  while(examSkippedCount>0 && attemptsLeft>0 && currentExam){
+    attemptsLeft--;
+    const candidates = conceptPoolAll.filter(x=>!exhaustedSources.has(x.id));
+    if(!candidates.length) break; // truly nothing left in the whole pool
+    const need = examSkippedCount;
+    examSkippedCount = 0; // this pass re-reports whatever still can't be filled
+    const { conceptNeed } = buildNeedItems(candidates, need);
+    if(!conceptNeed.length) break;
+    for(const batch of buildChunks(conceptNeed, 25)){
+      if(!currentExam) return;
+      await runConceptChunks([batch], pushFn, conceptPoolAll, usedSig);
+      await saveExam();
+    }
+  }
+}
+
+/* ---------------- background generation ---------------- */
 function appendGeneratedQuestion(q){
   if(!currentExam) return;
   const idx = currentExam.questions.length;
@@ -231,18 +253,16 @@ function renumberQuestions(){
 async function runConceptGenerationInBackground(queue, usedSig, conceptPoolAll){
   if(!queue.length){ finishConceptLoading(); return; }
   const push = q => egPush(appendGeneratedQuestion, q, usedSig);
-  // queue is already interleaved by buildNeedItems, and buildChunks keeps
-  // that order — so appended (unshuffled) background questions still land
-  // in a diverse, non-clustered order.
   for(const batch of buildChunks(queue, 25)){
     if(!currentExam) return;
     await runConceptChunks([batch], push, conceptPoolAll, usedSig);
     await saveExam();
   }
+  await refillShortfall(push, conceptPoolAll, usedSig);
   finishConceptLoading();
 }
 function finishConceptLoading(){
   if(currentExam){ currentExam.pendingConcept=false; saveExam(); }
   document.getElementById('loading-more-indicator')?.remove();
-  if(examSkippedCount) toast(`⚠ ${examSkippedCount}টি বৈধ variation তৈরি করা যায়নি; ভুল/duplicate প্রশ্ন দেখানো হয়নি`);
+  if(examSkippedCount) toast(`⚠ ${examSkippedCount}টি প্রশ্নের জন্য পুরো ব্যাংক থেকেও নতুন valid variation পাওয়া যায়নি`);
 }
