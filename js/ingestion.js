@@ -1,224 +1,398 @@
+/* ingestion.js — question input / ingestion / save
+
+   REWRITE RATIONALE (per product owner): the earlier "cut the text into
+   fixed line/char chunks" approach was the actual bug — it sliced
+   questions in half at arbitrary boundaries, so the AI correctly
+   reported "no valid question found" for a chunk that genuinely
+   contained no complete question. The fix isn't smarter chunking, it's
+   NO mechanical chunking at all.
+
+   The AI gets the FULL raw text/image every round and is trusted to use
+   its own judgment about where one question/fact ends and the next
+   begins — numbering present or not, numbering restarting mid-document,
+   several questions crammed into one paragraph with no line breaks,
+   whatever the real-world mess looks like. That's exactly the judgment
+   a person reading the same page would use, and there's no reason to
+   fence the model in with rigid line-count rules it doesn't need.
+
+   The multi-round loop now stops on its own natural signal — a round
+   that adds zero new questions — instead of trusting a self-reported
+   "hasMore" boolean (that boolean is what caused the earlier silent
+   truncation: the model just echoed the example's literal `false`).
+
+   Dependencies: core.js, gemini-model.js
+*/
+let currentIngestChapterId=null, attachedImage=null, ingestBusy=false;
+let ingestSeenSigs=new Set();
+
+/* ---------------- text/signature helpers ---------------- */
+function cleanIngestText(s=''){ return String(s).replace(/\s+/g,' ').trim(); }
+function canonIngest(s=''){
+  return cleanIngestText(s).toLowerCase()
+    .replace(/[""'']/g,'')
+    .replace(/[।,;:!?()[\]{}<>\/\\|+=_*^~$%#@-]/g,'')
+    .replace(/\s/g,'');
+}
+function ingestItemSig(q){
+  const opts = (q.options || q.optionExprs || []).map(canonIngest).join('|');
+  return canonIngest(q.stem||'') + '||' + opts + '||' + String(q.correctIndex ?? '');
+}
+function ingestSimilarity(a,b){
+  a=canonIngest(a); b=canonIngest(b);
+  if(!a||!b) return 0;
+  if(a===b) return 1;
+  const A=new Set(a.match(/[a-z\u0980-\u09ff0-9]+/g)||[]);
+  const B=new Set(b.match(/[a-z\u0980-\u09ff0-9]+/g)||[]);
+  let n=0; A.forEach(x=>B.has(x)&&n++);
+  return n / Math.max(1, new Set([...A,...B]).size);
+}
+function ingestNearDuplicate(stem, existingInChapter){
+  const s = canonIngest(stem);
+  if(!s) return true;
+  return existingInChapter.some(q => canonIngest(q.stem)===s || ingestSimilarity(q.stem, stem) >= 0.94);
+}
+function fourDistinct(a){
+  return Array.isArray(a) && a.length===4 && a.every(x=>cleanIngestText(x)) &&
+    new Set(a.map(canonIngest)).size===4;
+}
+function explicitSelection(s=''){
+  return /শুধু|কেবল|only|just|দাগানো|চিহ্নিত|মার্ক|marked|selected|highlighted|circled/i.test(s) ||
+    /(?:নম্বর|no\.?|question)\s*[০-৯0-9]+(?:\s*[,ও&]\s*[০-৯0-9]+)+/i.test(s);
+}
+
+/* ---------------- prompt ---------------- */
+function buildIngestPrompt(raw='', previous=[]){
+  const selective = explicitSelection(raw);
+  const prevList = previous.slice(-80);
+  const prev = prevList.length
+    ? `\nএই stem গুলো ইতিমধ্যে নেওয়া হয়েছে — এগুলো আবার দিও না, এবং এগুলোর ধারাবাহিকতা দেখে বুঝে নাও ইনপুটের বাকি অংশে আর কী কী রয়ে গেছে:\n${prevList.map((x,i)=>`${i+1}. ${x}`).join('\n')}`
+    : '';
+
+  return `তুমি একটি নির্ভুল প্রশ্ন-ব্যাংক এক্সট্র্যাকশন ইঞ্জিন। ইনপুটে ছবি এবং/অথবা টেক্সট থাকতে পারে, যেকোনো এলোমেলো ফরম্যাটে — নাম্বারিং থাকতে পারে বা নাও থাকতে পারে, নাম্বারিং একাধিকবার ১ থেকে আবার শুরু হতে পারে, একাধিক প্রশ্ন কোনো লাইন-ব্রেক ছাড়াই এক প্যারাগ্রাফে গাঁথা থাকতে পারে। এই বিশৃঙ্খলা বোঝাটা তোমার নিজের বিচারবুদ্ধির কাজ — ঠিক যেভাবে একজন মানুষ পাতাটা পড়ে বুঝে নিত কোথায় একটা প্রশ্ন/তথ্য শেষ হচ্ছে আর নতুনটা শুরু হচ্ছে, তুমিও সেভাবেই বুঝবে। কোনো নির্দিষ্ট লাইন-সংখ্যা বা ক্যারেক্টার-সংখ্যার নিয়ম মেনে চলার দরকার নেই।
+
+সিদ্ধান্তের নিয়ম:
+১) ছবিতে মার্ক/সার্কেল/হাইলাইট থাকলে অথবা টেক্সটে নির্দিষ্ট কিছু বেছে দেওয়া থাকলে (যেমন: "শুধু ৩,৭ নাও") — কেবল সেই নির্দিষ্ট অংশগুলোই নাও।
+২) এমন কোনো নির্দিষ্ট নির্দেশনা/মার্কিং না থাকলে — ইনপুটে যত সম্পূর্ণ, বৈধ প্রশ্ন/তথ্য আছে সবগুলো থেকেই item বানাও। যতটা এই এক দফায় সম্ভব ততটাই দাও — output সীমার কারণে যদি সবটা এক দফায় না আঁটে, যেগুলো ইতিমধ্যে সম্পূর্ণরূপে বুঝেছ ও যাচাই করেছ সেগুলো দাও, বাকিটা পরের দফায় হবে।
+${selective ? '\n→ এই ইনপুটে স্পষ্ট নির্বাচন-নির্দেশনা আছে, তাই নিয়ম ১ প্রযোজ্য।' : '\n→ এই ইনপুটে কোনো নির্বাচন-নির্দেশনা নেই, তাই নিয়ম ২ প্রযোজ্য।'}
+
+গুরুত্বপূর্ণ: ইনপুটের কোনো অংশ যদি অসম্পূর্ণ/কাটা প্রশ্নের মতো মনে হয় (শুরু বা শেষ স্পষ্ট না), সেটাকে item হিসেবে বানিও না — শুধু সম্পূর্ণ, স্পষ্ট প্রশ্ন/তথ্যই নাও।
+
+প্রতিটি item তৈরির সময়:
+- মূল concept, সমাধান পদ্ধতি ও উত্তরের যুক্তি হুবহু বজায় রাখবে। raw textbook lines/তথ্য হলে শুধু সেই নির্দিষ্ট তথ্য থেকেই MCQ বানাবে — বাইরের জ্ঞান/নতুন topic আনবে না।
+- বাংলা/ইংরেজি মূল ভাষা অপরিবর্তিত রাখবে। Math সবসময় $...$ এর ভেতরে লিখবে, ভাঙবে না।
+- concept item: ঠিক ৪টি ভিন্ন option এবং exactly ১টি সঠিক উত্তর।
+- numeric item: stem-এ {var} placeholder, প্রতিটি variable-এর min/max range, এবং ৪টি বৈধ, গণনাযোগ্য option expression।
+- figure/diagram থাকলে ছবিতে থাকা প্রকৃত value/relation-ই ব্যবহার করবে, কল্পিত কিছু না।
+- দুইটা item কখনো একে অপরের ডুপ্লিকেট হবে না।
+- শুধু নিচের ফরম্যাটে বৈধ JSON রিটার্ন করবে, অন্য কোনো টেক্সট/মার্কডাউন না।
+${prev}
+
+JSON ফরম্যাট:
+{"items":[{"type":"concept","stem":"...","options":["...","...","...","..."],"correctIndex":0,"explanation":"..."},{"type":"numeric","stem":"... {a} ...","variables":[{"name":"a","min":5,"max":25}],"optionExprs":["...","...","...","..."],"correctIndex":0,"explanation":"... {a} ..."}]}
+
+ইউজার ইনপুট:
+${raw || '(শুধু ছবি — ছবিটা মনোযোগ দিয়ে দেখো)'}
+`;
+}
+
+/* ---------------- validate + normalize ---------------- */
+function normalizeIngestItem(it){
+  if(!it || !it.type || !cleanIngestText(it.stem)) return null;
+  if(it.type==='numeric'){
+    const q = {
+      id: uid(), chapterId: currentIngestChapterId, type:'numeric',
+      stem: cleanIngestText(it.stem),
+      variables: Array.isArray(it.variables) ? it.variables.map(v=>({name:String(v.name||''), min:Number(v.min), max:Number(v.max)})) : [],
+      optionExprs: Array.isArray(it.optionExprs) ? it.optionExprs.map(String) : [],
+      correctIndex: Number(it.correctIndex),
+      explanation: cleanIngestText(it.explanation||'')
+    };
+    if(q.optionExprs.length!==4 || !Number.isInteger(q.correctIndex) || q.correctIndex<0 || q.correctIndex>3) return null;
+    if(!q.variables.length || q.variables.some(v=>!/^[A-Za-z]\w*$/.test(v.name) || !Number.isFinite(v.min) || !Number.isFinite(v.max) || v.min>v.max || v.max-v.min<3)) return null;
+    return q;
+  }
+  if(it.type==='concept' && fourDistinct(it.options)){
+    const q = {
+      id: uid(), chapterId: currentIngestChapterId, type:'concept',
+      stem: cleanIngestText(it.stem),
+      options: it.options.map(cleanIngestText),
+      correctIndex: Number(it.correctIndex),
+      explanation: cleanIngestText(it.explanation||'')
+    };
+    return (Number.isInteger(q.correctIndex) && q.correctIndex>=0 && q.correctIndex<4) ? q : null;
+  }
+  return null;
+}
+async function insertQuestionFromItem(chapterId, item){
+  const q = normalizeIngestItem(item);
+  if(!q) return false;
+  const existing = DB.questions.filter(x=>x.chapterId===chapterId);
+  if(ingestNearDuplicate(q.stem, existing) || ingestSeenSigs.has(ingestItemSig(q))) return false;
+  DB.questions.push(q);
+  ingestSeenSigs.add(ingestItemSig(q));
+  return true;
+}
+async function dedupeChapterQuestions(chapterId){
+  const list = DB.questions.filter(q=>q.chapterId===chapterId);
+  const keep = [], seen = new Set();
+  let removed = 0;
+  for(const q of list){
+    const sig = ingestItemSig(q);
+    if(seen.has(sig) || ingestNearDuplicate(q.stem, keep)){ removed++; continue; }
+    seen.add(sig); keep.push(q);
+  }
+  const ids = new Set(keep.map(q=>q.id));
+  DB.questions = DB.questions.filter(q=>q.chapterId!==chapterId || ids.has(q.id));
+  await saveQuestions();
+  toast(removed ? `ডুপ্লিকেট ${removed}টি মুছে ফেলা হয়েছে` : 'কোনো ডুপ্লিকেট পাওয়া যায়নি');
+  const v = document.getElementById('view');
+  if(v) v.innerHTML = viewQuestionList(chapterId);
+}
+
+/* One API call against the FULL (unmodified) input + insertion. */
+async function ingestOneRound(text, previous){
+  let data = null;
+  try{
+    data = await callGeminiAPI({
+      text: buildIngestPrompt(text, previous),
+      imageBase64: attachedImage?.base64,
+      imageMime: attachedImage?.mime
+    });
+  }catch(e){}
+  const items = Array.isArray(data?.items) ? data.items : [];
+  let added = 0;
+  const newStems = [];
+  for(const it of items){
+    if(await insertQuestionFromItem(currentIngestChapterId, it)){
+      added++;
+      newStems.push(cleanIngestText(it.stem).slice(0,180));
+    }
+  }
+  if(added) await saveQuestions();
+  return { added, newStems };
+}
+
+/* ---------------- run ingestion ---------------- */
+async function runIngest(){
+  const el = document.getElementById('ai-raw-text');
+  const raw = el ? el.value.trim() : '';
+  if(!raw && !attachedImage) return toast('টেক্সট লেখো, অথবা ছবি দাও');
+  const key = await sGet('geminiApiKey');
+  if(!key){ toast('প্রথমে Gemini API Key সেট করো'); if(typeof openSettingsModal==='function') openSettingsModal(); return; }
+  if(ingestBusy) return;
+  ingestBusy = true;
+  const btn = document.getElementById('ai-parse-btn');
+  if(btn) btn.disabled = true;
+
+  let total = 0, round = 0, previous = [];
+  const selective = explicitSelection(raw);
+  // A selective request ("শুধু ৩,৭") is answered in one pass. A bulk
+  // request loops on the FULL input each time — never a mechanical
+  // slice of it — and stops the moment a round adds nothing new. That's
+  // the actual "is there more?" signal, not a boolean the model reports.
+  const maxRounds = selective ? 1 : 15;
+  try{
+    while(round++ < maxRounds){
+      const { added, newStems } = await ingestOneRound(raw, previous);
+      total += added;
+      previous.push(...newStems);
+      updateIngestProgress(total, round);
+      if(!added) break;
+    }
+    if(total){
+      if(el){ el.value=''; autoGrowInput(el); }
+      clearAttachment();
+      toast(`✓ ${total} টি নতুন প্রশ্ন সংরক্ষিত হয়েছে`);
+    } else {
+      toast('নতুন কোনো বৈধ প্রশ্ন পাওয়া যায়নি');
+    }
+    const v = document.getElementById('view');
+    if(v && location.hash.startsWith('#/templates/')) v.innerHTML = viewQuestionList(currentIngestChapterId);
+  } finally {
+    ingestBusy = false;
+    if(btn) btn.disabled = false;
+    hideIngestProgress();
+  }
+}
+
 /* =====================================================================
-   gemini-model.js — THE PIECE MOST LIKELY TO NEED FUTURE CHANGES
-
-   This is the ONLY file that talks to the Gemini API network endpoint.
-   No model version numbers are hardcoded anywhere below. "auto" mode asks
-   Google's own ListModels endpoint which models the user's key can use
-   RIGHT NOW, scores them generically, and picks the best one. If that
-   model turns out to be retired/overloaded, it silently re-discovers or
-   walks to a Google-maintained "evergreen" alias — never a hardcoded
-   version string. Pro-class models are actively avoided since free-tier
-   keys typically have ZERO quota for them.
-
-   Also: current-generation Gemini models "think" by default before
-   answering. For structured extraction/generation tasks that eats the
-   output budget and can truncate or bury the real JSON answer under
-   reasoning text — this was the root cause of most "model just won't
-   work" failures. Every request explicitly disables thinking and asks
-   for a generous output budget; if a model doesn't support the
-   thinking toggle, we transparently retry that same request without it.
-
-   ONE-LINE CHANGE (this revision): maxOutputTokens raised from 8192 to
-   32768. This is NOT the daily free-tier call quota (that's a completely
-   separate Google-side limit and is untouched by this file) — it's just
-   how long a SINGLE response is allowed to be. 8192 was cutting off large
-   ingestion extractions (e.g. a 30+ question paste) mid-JSON. Nothing
-   else in this file changed.
-
-   Depends on (from core.js): sGet, sSet, sleep, openModal, closeModal, esc, toast
-   Exposes to everyone else: callGeminiAPI({text, imageBase64, imageMime})
-     -> resolves to the parsed JSON object the model returned.
-     Throws Error('NO_API_KEY') if no key is set.
-     Throws an auth-style Error only when the key itself is invalid/restricted.
-   Also exposes: openSettingsModal, saveSettings, redetectModel, discoverBestModel
+   INGEST MODAL — text + image input (file picker AND clipboard paste)
 ===================================================================== */
+function openIngestModal(chapterId){
+  currentIngestChapterId = chapterId;
+  attachedImage = null;
+  ingestSeenSigs = new Set();
 
-// The ONLY model name ever referenced literally in this app. NOT version-locked —
-// Google itself keeps this pointed at whatever its current best flash model is.
-// Pro-class is deliberately excluded (see scoreModelName): free-tier keys usually
-// have zero quota for it, which was producing confusing "quota exceeded" failures.
-const EVERGREEN_ALIASES = ['gemini-flash-latest'];
-
-function scoreModelName(name){
-  let s = 0;
-  if(/flash/i.test(name)) s += 50;
-  if(/latest/i.test(name)) s += 10;
-  if(/lite/i.test(name)) s -= 5;
-  if(/\bpro\b/i.test(name)) s -= 200; // avoid Pro-class: usually no free-tier quota
-  const verMatch = name.match(/(\d+)\.(\d+)/);
-  if(verMatch) s += (parseFloat(verMatch[1]+'.'+verMatch[2]) * 10);
-  if(/vision|embedding|aqa|gemma|image|tts|native-audio|nano-banana/i.test(name)) s -= 1000;
-  return s;
-}
-function isAuthError(e){
-  if(!e) return false;
-  if(e.status===401 || e.status===403) return true;
-  const msg = (e.message||'').toLowerCase();
-  return /api key not valid|permission denied|invalid authentication|oauth|api_key_invalid/.test(msg);
-}
-function isTransientError(e){
-  if(!e) return false;
-  if([429,500,502,503,504].includes(e.status)) return true;
-  const msg = (e.message||'').toLowerCase();
-  return /overloaded|unavailable|resource_exhausted|rate limit|quota|timeout|deadline|internal error|try again|server error/.test(msg);
-}
-function isModelMissingError(e){
-  if(!e) return false;
-  if(e.status===404) return true;
-  const msg = (e.message||'').toLowerCase();
-  return /not found|deprecated|retired|discontinued|decommissioned|no longer (available|supported)|is not supported/.test(msg);
-}
-async function discoverBestModel(apiKey){
-  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`);
-  if(!res.ok) throw new Error('মডেল তালিকা আনা যায়নি');
-  const data = await res.json();
-  const models = (data.models||[])
-    .filter(m => (m.supportedGenerationMethods||[]).includes('generateContent'))
-    .map(m => (m.name||'').replace('models/',''))
-    .filter(n => /gemini/i.test(n));
-  if(models.length===0) throw new Error('কোনো ব্যবহারযোগ্য Gemini মডেল পাওয়া যায়নি');
-  models.sort((a,b)=>scoreModelName(b)-scoreModelName(a));
-  return models[0];
-}
-async function getActiveModel(apiKey, forceRefresh){
-  const cache = await sGet('modelCache');
-  const now = Date.now();
-  if(!forceRefresh && cache && cache.model && (now - cache.at) < 24*3600*1000) return cache.model;
-  try{
-    const best = await discoverBestModel(apiKey);
-    await sSet('modelCache', {model:best, at:now});
-    return best;
-  }catch(e){
-    return (cache && cache.model) || EVERGREEN_ALIASES[0];
-  }
-}
-function extractJsonBlock(text){
-  const start = text.indexOf('{');
-  if(start===-1) return null;
-  let depth=0;
-  for(let i=start;i<text.length;i++){
-    if(text[i]==='{') depth++;
-    else if(text[i]==='}'){ depth--; if(depth===0) return text.slice(start,i+1); }
-  }
-  return null;
-}
-function safeJsonParse(raw){
-  const cleaned = raw.replace(/^```json\s*/i,'').replace(/^```\s*/,'').replace(/```\s*$/,'').trim();
-  try{ return JSON.parse(cleaned); }catch(e){}
-  const block = extractJsonBlock(cleaned);
-  if(block){ try{ return JSON.parse(block); }catch(e){} }
-  return null;
-}
-
-async function callGeminiAPI({text, imageBase64, imageMime}){
-  const apiKey = await sGet('geminiApiKey');
-  if(!apiKey) throw new Error('NO_API_KEY');
-
-  const parts = [{ text }];
-  if(imageBase64){ parts.push({ inline_data: { mime_type: imageMime || 'image/jpeg', data: imageBase64 } }); }
-
-  async function fetchOnce(model, includeThinkingToggle){
-    const cfg = { temperature: 0.6, maxOutputTokens: 32768 };
-    if(includeThinkingToggle) cfg.thinkingConfig = { thinkingBudget: 0 }; // disable "thinking" — it was eating the output budget and truncating our JSON
-    const reqBody = { contents: [{ role: 'user', parts }], generationConfig: cfg };
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
-    const res = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(reqBody) });
-    const data = await res.json().catch(()=>({}));
-    return { res, data };
-  }
-
-  async function attempt(model){
-    let { res, data } = await fetchOnce(model, true);
-    if(!res.ok && /thinking/i.test(data?.error?.message||'')){
-      // this model doesn't support the thinking toggle — retry the same model without it
-      ({ res, data } = await fetchOnce(model, false));
-    }
-    if(!res.ok){
-      const err = new Error(data?.error?.message || ('HTTP '+res.status));
-      err.status = res.status;
-      throw err;
-    }
-    // Drop any leftover "thinking" parts defensively — keep only the real answer text.
-    const rawParts = data?.candidates?.[0]?.content?.parts || [];
-    const outText = rawParts.filter(p=>!p.thought).map(p=>p.text||'').join('');
-    if(!outText) throw new Error('EMPTY_RESPONSE');
-    const parsed = safeJsonParse(outText);
-    if(!parsed) throw new Error('PARSE_FAILED');
-    return parsed;
-  }
-
-  const userModel = ((await sGet('geminiModel'))||'').trim();
-  const manualOverride = userModel && userModel.toLowerCase() !== 'auto';
-  const firstGuess = manualOverride ? userModel : await getActiveModel(apiKey, false);
-
-  const tried = new Set();
-  const queue = [firstGuess];
-  let lastErr = null;
-  let didRediscover = false;
-
-  while(queue.length){
-    const m = queue.shift();
-    if(tried.has(m)) continue;
-    tried.add(m);
-    let success = null, err = null;
-    for(let retry=0; retry<2; retry++){
-      try{ success = await attempt(m); break; }
-      catch(e){
-        err = e;
-        if(isAuthError(e)) throw e; // a bad/restricted key can't be fixed by switching models
-        if(isTransientError(e) && retry===0){ await sleep(300+Math.random()*300); continue; }
-        break;
-      }
-    }
-    if(success){ await sSet('modelCache', {model:m, at:Date.now()}); return success; }
-    lastErr = err;
-    if(!didRediscover && isModelMissingError(err) && !manualOverride){
-      didRediscover = true;
-      try{ const fresh = await getActiveModel(apiKey, true); if(!tried.has(fresh)) queue.push(fresh); }catch(e){}
-    }
-    EVERGREEN_ALIASES.forEach(a=>{ if(!tried.has(a) && !queue.includes(a)) queue.push(a); });
-  }
-  throw lastErr || new Error('এই মুহূর্তে কোনো Gemini মডেল সাড়া দিচ্ছে না, একটু পর আবার চেষ্টা করো');
-}
-
-/* ---------------- settings UI ---------------- */
-document.getElementById('settings-btn').addEventListener('click', openSettingsModal);
-async function openSettingsModal(){
-  const key = (await sGet('geminiApiKey')) || '';
-  const model = (await sGet('geminiModel')) || 'auto';
-  const cache = await sGet('modelCache');
   openModal(`
-    <h3>Gemini API সেটিংস</h3>
-    <p class="hint" style="margin-bottom:14px;">প্রশ্ন থেকে AI দিয়ে প্রশ্ন তৈরি করতে তোমার নিজের Gemini API Key দরকার। এটি শুধু তোমার ব্রাউজারে সংরক্ষিত থাকে। Key নিতে <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">Google AI Studio</a> ভিজিট করো।</p>
-    <div class="field"><label>API Key</label><input id="set-api-key" type="password" value="${esc(key)}" placeholder="AIza..."></div>
-    <div class="field"><label>মডেল</label>
-      <input id="set-model" type="text" value="${esc(model)}" placeholder="auto">
-      <div class="hint">"auto" রাখলে অ্যাপ প্রতিবার key দিয়ে জিজ্ঞেস করে দেখে নেয় এই মুহূর্তে কোন Gemini মডেল সচল আছে এবং ফ্রি-টিয়ারে ব্যবহারযোগ্য (Pro-ক্লাস মডেল এড়িয়ে চলে), এবং সেটাই ব্যবহার করে।</div>
-      <div class="hint" style="margin-top:8px;">শেষ ব্যবহৃত মডেল: <b>${cache && cache.model ? esc(cache.model) : 'এখনো সনাক্ত হয়নি'}</b> · <button type="button" class="link-btn" onclick="redetectModel()">পুনরায় সনাক্ত করো</button></div>
+    <h3>প্রশ্ন যোগ করো (AI)</h3>
+    <p class="hint" style="margin-bottom:12px;">
+      ছবি দাও (আপলোড বাটনে অথবা সরাসরি <b>Ctrl+V</b> দিয়ে paste করো), বা টেক্সট লেখো — যেকোনো ফরম্যাটে, নাম্বারিং ছাড়াই বা এলোমেলো হলেও চলবে।
+      নির্দিষ্ট কিছু চাইলে লিখে দাও (যেমন: "শুধু ৩, ৭ নাও") — কিছু না লিখলে ইনপুটে যা আছে সবটাই যোগ হবে।
+    </p>
+    <div class="unified-input">
+      <div id="attach-preview-wrap"></div>
+      <div class="input-row">
+        <input type="file" id="ingest-file-input" accept="image/*" style="display:none;">
+        <button type="button" class="input-icon-btn" id="ingest-attach-btn" title="ছবি সংযুক্ত করো">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h3l2-3h6l2 3h3v13H4V7z"/><circle cx="12" cy="13" r="3.5"/></svg>
+        </button>
+        <textarea id="ai-raw-text" rows="1" placeholder="নির্দেশনা বা প্রশ্ন লেখো (ঐচ্ছিক)... ছবি paste করতে এখানে ক্লিক করে Ctrl+V দাও"></textarea>
+        <button type="button" class="input-send-btn" id="ai-parse-btn" title="পাঠাও">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+        </button>
+      </div>
     </div>
-    <div class="btn-row">
-      <button class="btn btn-primary" onclick="saveSettings()">সংরক্ষণ করুন</button>
-      <button class="btn" onclick="closeModal()">বাতিল</button>
-    </div>`);
-  setTimeout(()=>document.getElementById('set-api-key').focus(),50);
+    <div id="ingest-progress" class="hint" style="min-height:16px; margin-bottom:6px;"></div>
+    <div class="btn-row" style="margin-top:4px;">
+      <button class="btn" onclick="closeModal()">বন্ধ করো</button>
+    </div>
+  `);
+
+  const ta = document.getElementById('ai-raw-text');
+  ta.addEventListener('input', ()=>autoGrowInput(ta));
+  ta.addEventListener('paste', handleIngestPaste);
+  setTimeout(()=>ta.focus(), 50);
+
+  document.getElementById('ingest-attach-btn').addEventListener('click', ()=>{
+    document.getElementById('ingest-file-input').click();
+  });
+  document.getElementById('ingest-file-input').addEventListener('change', handleIngestFileSelect);
+  document.getElementById('ai-parse-btn').addEventListener('click', runIngest);
 }
-async function saveSettings(){
-  const key = document.getElementById('set-api-key').value.trim();
-  const model = document.getElementById('set-model').value.trim() || 'auto';
-  await sSet('geminiApiKey', key);
-  await sSet('geminiModel', model);
-  await sSet('modelCache', null);
+function autoGrowInput(el){
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 260) + 'px';
+}
+function readImageFile(file){
+  const reader = new FileReader();
+  reader.onload = ()=>{
+    const result = reader.result || '';
+    const comma = result.indexOf(',');
+    if(comma===-1) return;
+    attachedImage = { base64: result.slice(comma+1), mime: file.type || 'image/jpeg' };
+    renderAttachPreview();
+  };
+  reader.readAsDataURL(file);
+}
+function handleIngestFileSelect(e){
+  const file = e.target.files && e.target.files[0];
+  if(file) readImageFile(file);
+  e.target.value = '';
+}
+function handleIngestPaste(e){
+  const items = (e.clipboardData && e.clipboardData.items) || [];
+  for(const item of items){
+    if(item.type && item.type.indexOf('image/')===0){
+      const file = item.getAsFile();
+      if(file){ e.preventDefault(); readImageFile(file); toast('ছবি সংযুক্ত হয়েছে'); }
+      return;
+    }
+  }
+}
+function renderAttachPreview(){
+  const wrap = document.getElementById('attach-preview-wrap');
+  if(!wrap) return;
+  if(!attachedImage){ wrap.innerHTML=''; return; }
+  wrap.innerHTML = `<div class="attach-preview">
+    <img src="data:${attachedImage.mime};base64,${attachedImage.base64}" alt="সংযুক্ত ছবি">
+    <button type="button" onclick="clearAttachment()">✕</button>
+  </div>`;
+}
+function clearAttachment(){
+  attachedImage = null;
+  const wrap = document.getElementById('attach-preview-wrap');
+  if(wrap) wrap.innerHTML = '';
+}
+function updateIngestProgress(totalSoFar, round){
+  const el = document.getElementById('ingest-progress');
+  if(!el) return;
+  el.textContent = totalSoFar
+    ? `দফা ${round} — এখন পর্যন্ত ${totalSoFar}টি প্রশ্ন সংরক্ষিত হয়েছে...`
+    : `দফা ${round} — পড়া হচ্ছে...`;
+}
+function hideIngestProgress(){
+  const el = document.getElementById('ingest-progress');
+  if(el) el.textContent = '';
+}
+
+/* =====================================================================
+   QUESTION EDIT MODAL
+===================================================================== */
+function openQuestionEditForm(chapterId, questionId){
+  const q = DB.questions.find(x=>x.id===questionId);
+  if(!q) return;
+
+  if(q.type==='numeric'){
+    openModal(`
+      <h3>প্রশ্ন সম্পাদনা (সাংখ্যিক)</h3>
+      <div class="field"><label>Stem — চলক থাকলে {a} আকারে লেখো</label><textarea id="edit-stem">${esc(q.stem)}</textarea></div>
+      <div class="field">
+        <label>Variables — এক লাইনে একটি, ফরম্যাট: name,min,max</label>
+        <textarea id="edit-vars">${q.variables.map(v=>`${v.name},${v.min},${v.max}`).join('\n')}</textarea>
+        <div class="hint">যেমন: a,5,25</div>
+      </div>
+      <div class="field">
+        <label>Option expressions — ঠিক ৪টি, এক লাইনে একটি</label>
+        <textarea id="edit-optexprs">${(q.optionExprs||[]).join('\n')}</textarea>
+      </div>
+      <div class="field"><label>সঠিক Option নম্বর (0 থেকে 3)</label><input id="edit-correct" type="number" min="0" max="3" value="${q.correctIndex}"></div>
+      <div class="field"><label>ব্যাখ্যা</label><textarea id="edit-explain">${esc(q.explanation||'')}</textarea></div>
+      <div class="btn-row">
+        <button class="btn btn-primary" onclick="saveQuestionEdit('${chapterId}','${questionId}')">সংরক্ষণ করুন</button>
+        <button class="btn" onclick="closeModal()">বাতিল</button>
+      </div>
+    `);
+  } else {
+    openModal(`
+      <h3>প্রশ্ন সম্পাদনা</h3>
+      <div class="field"><label>প্রশ্ন</label><textarea id="edit-stem">${esc(q.stem)}</textarea></div>
+      ${q.options.map((o,i)=>`
+        <div class="opt-row">
+          <input type="radio" name="edit-correct-radio" value="${i}" ${q.correctIndex===i?'checked':''}>
+          <input type="text" class="edit-opt" value="${esc(o)}">
+        </div>`).join('')}
+      <div class="hint" style="margin:-2px 0 12px;">রেডিও বাটন দিয়ে সঠিক উত্তর বেছে দাও</div>
+      <div class="field"><label>ব্যাখ্যা</label><textarea id="edit-explain">${esc(q.explanation||'')}</textarea></div>
+      <div class="btn-row">
+        <button class="btn btn-primary" onclick="saveQuestionEdit('${chapterId}','${questionId}')">সংরক্ষণ করুন</button>
+        <button class="btn" onclick="closeModal()">বাতিল</button>
+      </div>
+    `);
+  }
+}
+async function saveQuestionEdit(chapterId, questionId){
+  const q = DB.questions.find(x=>x.id===questionId);
+  if(!q) return;
+  const stem = document.getElementById('edit-stem').value.trim();
+  if(!stem) return toast('প্রশ্ন খালি রাখা যাবে না');
+
+  if(q.type==='numeric'){
+    const varsRaw = document.getElementById('edit-vars').value.trim().split('\n').map(l=>l.trim()).filter(Boolean);
+    const vars = varsRaw.map(l=>{
+      const [name,min,max] = l.split(',').map(s=>(s||'').trim());
+      return {name, min:Number(min), max:Number(max)};
+    });
+    if(!vars.length || vars.some(v=>!/^[A-Za-z]\w*$/.test(v.name)||!Number.isFinite(v.min)||!Number.isFinite(v.max)||v.min>v.max||v.max-v.min<3)){
+      return toast('Variables সঠিক নয় — name,min,max ফরম্যাটে দাও, range অন্তত ৩ হতে হবে');
+    }
+    const exprs = document.getElementById('edit-optexprs').value.trim().split('\n').map(s=>s.trim()).filter(Boolean);
+    if(exprs.length!==4) return toast('ঠিক ৪টি option expression দিতে হবে');
+    const ci = parseInt(document.getElementById('edit-correct').value,10);
+    if(!Number.isInteger(ci)||ci<0||ci>3) return toast('সঠিক Option নম্বর 0 থেকে 3 এর মধ্যে দাও');
+    q.stem = cleanIngestText(stem); q.variables = vars; q.optionExprs = exprs; q.correctIndex = ci;
+    q.explanation = cleanIngestText(document.getElementById('edit-explain').value);
+  } else {
+    const opts = [...document.querySelectorAll('.edit-opt')].map(el=>el.value.trim());
+    if(!fourDistinct(opts)) return toast('ঠিক ৪টি ভিন্ন option দাও, কোনোটি খালি রাখা যাবে না');
+    const radio = document.querySelector('input[name="edit-correct-radio"]:checked');
+    if(!radio) return toast('সঠিক উত্তর নির্বাচন করো');
+    q.stem = cleanIngestText(stem); q.options = opts.map(cleanIngestText); q.correctIndex = parseInt(radio.value,10);
+    q.explanation = cleanIngestText(document.getElementById('edit-explain').value);
+  }
+
+  await saveQuestions();
   closeModal();
-  toast(key ? '✅ API সেটিংস সংরক্ষিত হয়েছে' : 'API key খালি রাখা হয়েছে');
-}
-async function redetectModel(){
-  const apiKey = (document.getElementById('set-api-key')?.value.trim()) || (await sGet('geminiApiKey'));
-  if(!apiKey){ toast('প্রথমে API Key দিন'); return; }
-  toast('সক্রিয় মডেল সনাক্ত করা হচ্ছে...');
-  try{
-    const best = await discoverBestModel(apiKey);
-    await sSet('modelCache', {model:best, at:Date.now()});
-    toast('✅ সক্রিয় মডেল: '+best);
-    closeModal(); openSettingsModal();
-  }catch(e){ toast('সনাক্ত করা যায়নি: '+e.message); }
+  const v = document.getElementById('view');
+  if(v) v.innerHTML = viewQuestionList(chapterId);
+  toast('✓ সংরক্ষিত হয়েছে');
 }
