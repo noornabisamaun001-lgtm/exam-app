@@ -1,29 +1,32 @@
 /* exam-generation.js — exam question generation from saved core questions
 
-   CORE IDEA (this is the whole point of the app): the student saves N core
-   questions per chapter; an exam of size M draws from that pool, repeating
-   patterns as needed via controlled variation — but two questions from the
-   SAME core pattern must never land back-to-back, and the same wording must
-   never repeat verbatim. Everything below exists to guarantee that.
+   CORE IDEA: the student saves N core questions per chapter; an exam of
+   size M draws from that pool, repeating patterns as needed via
+   controlled variation — but two questions from the SAME core pattern
+   must never land back-to-back, and generated variations must be
+   genuinely different from each other, not trivial algebraic flips.
 
-   THE BUG THIS REWRITE FIXES: the previous version tracked "need" as one
-   aggregated number per source pattern (e.g. "pattern A needs 12"), then
-   generated and pushed all 12 of pattern A in a row before moving to
-   pattern B. That's exactly why 10-12 questions from the same pattern were
-   showing up consecutively in exams — the grouping happened before any
-   shuffle ever ran, and the background-appended tail never got shuffled
-   at all.
-
-   THE FIX: buildNeedItems() now expands "need" into individual slots and
-   interleaves them round-robin across all patterns (A,B,C,A,B,C...,
-   re-shuffled each round). Every function downstream — batching, AI
-   prompting, and especially the order results get pushed into the exam —
-   preserves that interleaved order. The AI is still asked efficiently
-   (one request per pattern, not one request per slot), but consumption of
-   its answers follows the interleaved slot order, not the AI's grouping.
+   Two things fixed this round (on top of the earlier interleaving fix):
+   1) Variations were too similar to each other (e.g. "(1+i)/(1-i)" then
+      later "(1-i)/(1+i)" — a trivial flip, not a real new variation).
+      Fix: each source pattern now carries a running history of stems
+      already generated for it THIS EXAM, sent back to the AI as an
+      explicit "avoid repeating these" list, plus a direct instruction
+      that swapping signs/reciprocals/order is not a valid variation.
+   2) Large exams (e.g. 200 questions) fell short of the target when the
+      core-question pool was small, because each source pattern had to
+      produce many unique variations and kept losing to the duplicate
+      check. Retry depth bumped 2 -> 3 to recover more of the shortfall.
+      (This is fundamentally limited by pool size — a 5-6 question pool
+      cannot realistically yield 200 truly unique variations; more core
+      questions is the real fix for very large exams.)
 */
 let examSkippedCount=0;
-function resetExamSkipCounter(){ examSkippedCount=0; }
+let sourceVariationHistory=new Map(); // sourceId -> stems already generated this exam
+function resetExamSkipCounter(){
+  examSkippedCount=0;
+  sourceVariationHistory=new Map();
+}
 
 /* ---------------- numeric math engine ---------------- */
 function egSubst(t,v){ return String(t||'').replace(/\{([A-Za-z]\w*)\}/g,(m,k)=>Object.prototype.hasOwnProperty.call(v,k)?String(v[k]):m); }
@@ -81,18 +84,15 @@ function generateNumericInstant(it, usedSig){
 function fallbackFromConcept(){ return null; }
 function pickUnusedFallback(){ return null; }
 
-/* ---------------- need calculation — the interleaving fix lives here ---------------- */
+/* ---------------- need calculation — round-robin interleaved so the SAME
+   pattern never clusters together in the exam ---------------- */
 function buildNeedItems(pool, n){
   const p = shuffleArr([...pool]);
   if(p.length===0) return { numericNeed:[], conceptNeed:[] };
 
-  // how many times each pool[i] pattern is needed, round-robin distributed
   const counts = new Array(p.length).fill(0);
   for(let i=0;i<n;i++) counts[i % p.length]++;
 
-  // expand into individual need=1 slots, interleaved round by round so the
-  // SAME pattern is never adjacent to itself in the resulting order. Each
-  // round we also re-shuffle which pattern goes first, for extra variety.
   const maxCount = Math.max(...counts);
   const slots = [];
   for(let round=0; round<maxCount; round++){
@@ -108,8 +108,6 @@ function buildNeedItems(pool, n){
   };
 }
 
-/* Chunking just batches the already-interleaved slot list sequentially —
-   order is preserved, so a chunk's internal order stays interleaved too. */
 function buildChunks(items, batchSize=25){
   const out=[]; let cur=[];
   for(const it of items){
@@ -121,11 +119,22 @@ function buildChunks(items, batchSize=25){
 }
 
 function buildExamGenPrompt(items){
-  const payload = items.map(it=>({ id:it.id, need:it.need, stem:it.stem, options:it.options, correctIndex:it.correctIndex, explanation:it.explanation||'' }));
+  // items already carry `avoid`: stems generated for that exact source so far.
+  const payload = items.map(it=>({
+    id: it.id, need: it.need, stem: it.stem, options: it.options,
+    correctIndex: it.correctIndex, explanation: it.explanation||'',
+    avoid: it.avoid||[]
+  }));
   return `তুমি বাংলাদেশের ভর্তি পরীক্ষার জন্য STRICT MCQ VARIATION ENGINE।
-প্রতিটি source-এর মূল concept, required knowledge, solving method, difficulty ও answer logic অপরিবর্তিত রাখবে। শুধু controlled wording/context/numerical/figure variation করবে।
-নতুন topic, fact, chapter বা শেখানোর প্রশ্ন যোগ করবে না।
-একই source-এর দুই variation একে অপরের duplicate হতে পারবে না।
+
+প্রতিটি source-এর মূল concept, required knowledge, solving method, difficulty ও answer logic অপরিবর্তিত রাখবে।
+
+VARIATION আসলেই ভিন্ন হতে হবে — এটা কঠোরভাবে মানবে:
+- শুধু sign flip করা (a+ib থেকে a-ib), fraction উল্টানো ((z-a)/(z-b) থেকে (z-b)/(z-a)), বা numerator/denominator অদল-বদল করা — এগুলো বৈধ variation না, এগুলো ব্যবহার করবে না।
+- প্রতিটি variation-এ প্রকৃতপক্ষে ভিন্ন সংখ্যা/coefficient/জটিল সংখ্যা ব্যবহার করবে যা দিয়ে গণনা করলে ভিন্ন intermediate step লাগে, কিন্তু concept ও method একই থাকে।
+- প্রতিটি item-এর সাথে তার "avoid" তালিকা দেওয়া আছে — ঐ stem গুলোর কাছাকাছি গঠনের (structurally similar) কিছু বানাবে না, নতুন কিছু বানাবে।
+- একই source-এর দুই variation একে অপরের duplicate বা near-duplicate হতে পারবে না।
+
 Math equation সবসময় $...$-এ লিখবে।
 Figure হলে প্রয়োজনীয় relation/value text-এ সম্পূর্ণভাবে দেবে; কল্পিত/অসম্পূর্ণ figure নয়।
 প্রতিটি প্রশ্নে ঠিক 4টি distinct option এবং exactly 1 correct option থাকবে।
@@ -140,11 +149,11 @@ ${JSON.stringify(payload)}`;
 }
 
 /* runConceptBatch: asks the AI efficiently (one aggregated entry per source
-   id, so a pattern needed 5 times in this chunk is asked for once as
-   need:5 — saves tokens and gives the model proper context that these are
-   variations of ONE question) but then distributes/pushes the results by
-   walking the ORIGINAL interleaved `chunk` order, one slot at a time. That
-   walk is what keeps same-pattern questions apart in the final exam. */
+   id within this chunk) but distributes/pushes results by walking the
+   ORIGINAL interleaved `chunk` order — that's what keeps same-pattern
+   questions apart in the final exam. Successful pushes are recorded into
+   sourceVariationHistory so later batches (including background ones)
+   know what to avoid repeating. */
 async function runConceptBatch(chunk, pushFn, conceptPoolAll, usedSig, depth=0){
   const byId = new Map();
   for(const it of chunk){
@@ -152,9 +161,12 @@ async function runConceptBatch(chunk, pushFn, conceptPoolAll, usedSig, depth=0){
     if(existing) existing.need += it.need;
     else byId.set(it.id, {...it});
   }
+  const payloadItems = [...byId.values()].map(it=>({
+    ...it, avoid: (sourceVariationHistory.get(it.id)||[]).slice(-15)
+  }));
 
   let data=null;
-  try{ data = await callGeminiAPI({ text: buildExamGenPrompt([...byId.values()]) }); }catch(_){}
+  try{ data = await callGeminiAPI({ text: buildExamGenPrompt(payloadItems) }); }catch(_){}
   const generated = Array.isArray(data?.generated) ? data.generated : [];
   const bySource = {};
   generated.forEach(g=>{ if(g?.sourceId) (bySource[g.sourceId] ??= []).push(g); });
@@ -173,12 +185,17 @@ async function runConceptBatch(chunk, pushFn, conceptPoolAll, usedSig, depth=0){
         stem: String(g.stem).trim(), options: g.options.map(x=>String(x).trim()),
         correctIndex: ci, explanation: String(g.explanation||it.explanation||'').trim()
       };
-      if(pushFn(q)) placed = true;
+      if(pushFn(q)){
+        placed = true;
+        const hist = sourceVariationHistory.get(it.id) || [];
+        hist.push(q.stem);
+        sourceVariationHistory.set(it.id, hist);
+      }
     }
     if(!placed) retryList.push(it);
   }
 
-  if(retryList.length && depth<2){
+  if(retryList.length && depth<3){
     await runConceptBatch(retryList, pushFn, conceptPoolAll, usedSig, depth+1);
   } else if(retryList.length){
     examSkippedCount += retryList.length;
