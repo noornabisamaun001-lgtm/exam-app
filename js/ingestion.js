@@ -1,13 +1,17 @@
 /* ingestion.js — question input / ingestion / save
-   Core rule (per product owner): the AI should behave exactly like a
-   competent human reading the same input:
-     - if the user pointed at specific questions (marked/circled/"only 3,7"),
-       take ONLY those.
-     - if the user gave NO such restriction, take EVERY valid question/fact
-       found in the input — that's the default, not an edge case.
-   Everything else (dedup, validation, math/Bengali integrity) exists only
-   to keep the saved data sheet clean, since duplicate/broken saved
-   questions are what cause duplicate/broken exam questions later.
+
+   Two real bugs fixed this round:
+   1) The JSON schema example in the prompt showed a literal `"hasMore":false`.
+      Models anchor hard on concrete example values in a schema — it was
+      just echoing false every time, so a 37-question paste only ever
+      yielded whatever fit in ONE response before the loop gave up.
+      Fix: no literal boolean in the example; the rule is stated in prose,
+      and each round is deliberately capped to a small item count so a
+      big input needs (and reliably gets) multiple rounds instead of
+      silently truncating.
+   2) No way to paste an image from the clipboard (desktop) — only a file
+      picker. Added a paste handler on the input box.
+
    Dependencies: core.js, gemini-model.js
 */
 let currentIngestChapterId=null, attachedImage=null, ingestBusy=false;
@@ -53,30 +57,43 @@ function explicitSelection(s=''){
 }
 
 /* ---------------- prompt ---------------- */
+/* Each round asks for a SMALL, bounded batch on purpose — a big page/paste
+   with 30-40 questions must never be attempted in one response (that's what
+   was silently truncating output). The round loop in runIngest() keeps
+   calling this until hasMore comes back false or the round cap is hit. */
+const INGEST_BATCH_CAP = 12;
+
 function buildIngestPrompt(raw='', previous=[]){
   const selective = explicitSelection(raw);
-  const prev = previous.length
-    ? `\nএই stem গুলো ইতিমধ্যে নেওয়া হয়েছে — এগুলো আবার দিও না:\n${previous.map((x,i)=>`${i+1}. ${x}`).join('\n')}`
+  const prevList = previous.slice(-50); // keep the prompt from ballooning over many rounds
+  const prev = prevList.length
+    ? `\nএই stem গুলো ইতিমধ্যে নেওয়া হয়েছে — এগুলো আবার দিও না:\n${prevList.map((x,i)=>`${i+1}. ${x}`).join('\n')}`
     : '';
   return `তুমি একটি নির্ভুল প্রশ্ন-ব্যাংক এক্সট্র্যাকশন ইঞ্জিন। ইনপুটে ছবি এবং/অথবা টেক্সট থাকতে পারে।
 
 সিদ্ধান্তের নিয়ম:
 ১) ছবিতে মার্ক/সার্কেল/হাইলাইট থাকলে অথবা টেক্সটে নির্দিষ্ট কিছু বেছে দেওয়া থাকলে (যেমন: "শুধু ৩,৭ নাও", "শুধু দাগানোগুলো") — তাহলে কেবল সেই নির্দিষ্ট অংশগুলোই নাও, বাকি সব বাদ দাও।
-২) এমন কোনো নির্দিষ্ট নির্দেশনা/মার্কিং না থাকলে — ইনপুটে যত বৈধ প্রশ্ন/তথ্য আছে সবগুলো থেকেই item বানাও। এটাই স্বাভাবিক আচরণ, কিছু বাদ দেওয়ার দরকার নেই।
-${selective ? '\n→ এই ইনপুটে স্পষ্ট নির্বাচন-নির্দেশনা আছে, তাই নিয়ম ১ প্রযোজ্য।' : '\n→ এই ইনপুটে কোনো নির্বাচন-নির্দেশনা নেই, তাই নিয়ম ২ প্রযোজ্য — সব নাও।'}
+২) এমন কোনো নির্দিষ্ট নির্দেশনা/মার্কিং না থাকলে — ইনপুটে যত বৈধ প্রশ্ন/তথ্য আছে সবগুলোই ধরে নাও প্রয়োজন। এটাই স্বাভাবিক আচরণ।
+${selective ? '\n→ এই ইনপুটে স্পষ্ট নির্বাচন-নির্দেশনা আছে, তাই নিয়ম ১ প্রযোজ্য।' : '\n→ এই ইনপুটে কোনো নির্বাচন-নির্দেশনা নেই, তাই নিয়ম ২ প্রযোজ্য।'}
+
+এই দফায় (batch) সর্বোচ্চ ${INGEST_BATCH_CAP}টি item দিবে — এর বেশি থাকলেও এখন সবগুলো দেওয়ার দরকার নেই।
+"hasMore" ফিল্ডের নিয়ম (গুরুত্বপূর্ণ):
+- ইনপুটে (ছবি/টেক্সটে) যদি এই ${INGEST_BATCH_CAP}টার বাইরেও আরও বৈধ, না-নেওয়া প্রশ্ন/তথ্য অবশিষ্ট থাকে → "hasMore": true দিবে।
+- ইনপুটের সবটুকু বৈধ কনটেন্ট এই দফাতেই কভার হয়ে গেলে, বা আর কিছু অবশিষ্ট না থাকলে → "hasMore": false দিবে।
+- এই মান তুমি ইনপুট নিজে পরীক্ষা করে ঠিক করবে, কোনো ডিফল্ট বা অনুমান করে বসাবে না।
 
 প্রতিটি item তৈরির সময়:
-- মূল concept, সমাধান পদ্ধতি ও উত্তরের যুক্তি হুবহু বজায় রাখবে। raw textbook lines হলে শুধু সেই নির্দিষ্ট তথ্য থেকেই MCQ বানাবে — বাইরের জ্ঞান/নতুন topic আনবে না।
+- মূল concept, সমাধান পদ্ধতি ও উত্তরের যুক্তি হুবহু বজায় রাখবে। raw textbook lines/তথ্য হলে শুধু সেই নির্দিষ্ট তথ্য থেকেই MCQ বানাবে — বাইরের জ্ঞান/নতুন topic আনবে না।
 - বাংলা/ইংরেজি মূল ভাষা অপরিবর্তিত রাখবে। Math সবসময় $...$ এর ভেতরে লিখবে, ভাঙবে না।
 - concept item: ঠিক ৪টি ভিন্ন option এবং exactly ১টি সঠিক উত্তর।
 - numeric item: stem-এ {var} placeholder, প্রতিটি variable-এর min/max range, এবং ৪টি বৈধ, গণনাযোগ্য option expression।
 - figure/diagram থাকলে ছবিতে থাকা প্রকৃত value/relation-ই ব্যবহার করবে, কল্পিত কিছু না।
-- একই ইনপুটের মধ্যে দুইটা item কখনো একে অপরের ডুপ্লিকেট হবে না।
+- একই দফার মধ্যে দুইটা item কখনো একে অপরের ডুপ্লিকেট হবে না।
 - শুধু নিচের ফরম্যাটে বৈধ JSON রিটার্ন করবে, অন্য কোনো টেক্সট/মার্কডাউন না।
 ${prev}
 
-JSON ফরম্যাট:
-{"items":[{"type":"concept","stem":"...","options":["...","...","...","..."],"correctIndex":0,"explanation":"..."},{"type":"numeric","stem":"... {a} ...","variables":[{"name":"a","min":5,"max":25}],"optionExprs":["...","...","...","..."],"correctIndex":0,"explanation":"... {a} ..."}],"hasMore":false}
+JSON ফরম্যাট (hasMore-এর মান উপরের নিয়ম অনুযায়ী তুমি বসাবে, উদাহরণে যা দেখানো হয়েছে সেটা শুধু গঠন বোঝানোর জন্য):
+{"items":[{"type":"concept","stem":"...","options":["...","...","...","..."],"correctIndex":0,"explanation":"..."},{"type":"numeric","stem":"... {a} ...","variables":[{"name":"a","min":5,"max":25}],"optionExprs":["...","...","...","..."],"correctIndex":0,"explanation":"... {a} ..."}],"hasMore":"true অথবা false, নিয়ম অনুযায়ী"}
 
 ইউজার ইনপুট:
 ${raw || '(শুধু ছবি — ছবিটা মনোযোগ দিয়ে দেখো)'}
@@ -154,9 +171,10 @@ async function runIngest(){
   try{
     // A selective request ("শুধু ৩,৭") needs exactly one pass — looping
     // again would risk the model reinterpreting and adding extras.
-    // A bulk/whole-input request may need a few passes for a page packed
-    // with many questions, bounded so it can never run away.
-    const maxRounds = selective ? 1 : 8;
+    // A bulk/whole-input request may span many small batches (see
+    // INGEST_BATCH_CAP) — bounded high enough that a 40-50 question
+    // paste still finishes automatically without the user re-clicking.
+    const maxRounds = selective ? 1 : 20;
     while(round++ < maxRounds){
       let data = null;
       try{
@@ -175,6 +193,10 @@ async function runIngest(){
         }
       }
       if(added) await saveQuestions();
+      if(updateIngestProgress) updateIngestProgress(total);
+      // Stop only when the model explicitly says nothing is left, or a
+      // round produced literally nothing usable (avoids spinning forever
+      // on a bad response).
       if(!added || data?.hasMore===false) break;
     }
     if(total){
@@ -189,13 +211,14 @@ async function runIngest(){
   } finally {
     ingestBusy = false;
     if(btn) btn.disabled = false;
+    hideIngestProgress();
   }
 }
 
 /* =====================================================================
-   INGEST MODAL — text + image input, uses the app's existing
-   .unified-input / #ai-raw-text / .attach-preview / .input-icon-btn /
-   .input-send-btn styling.
+   INGEST MODAL — text + image input (file picker AND clipboard paste),
+   uses the app's existing .unified-input / #ai-raw-text / .attach-preview
+   / .input-icon-btn / .input-send-btn styling.
 ===================================================================== */
 function openIngestModal(chapterId){
   currentIngestChapterId = chapterId;
@@ -205,8 +228,8 @@ function openIngestModal(chapterId){
   openModal(`
     <h3>প্রশ্ন যোগ করো (AI)</h3>
     <p class="hint" style="margin-bottom:12px;">
-      ছবি দাও অথবা টেক্সট লেখো। নির্দিষ্ট কিছু চাইলে লিখে দাও (যেমন: "শুধু ৩, ৭ নাও") —
-      কিছু না লিখলে ইনপুটে যা আছে সবটাই যোগ হবে।
+      ছবি দাও (আপলোড বাটনে অথবা সরাসরি <b>Ctrl+V</b> দিয়ে paste করো), বা টেক্সট লেখো।
+      নির্দিষ্ট কিছু চাইলে লিখে দাও (যেমন: "শুধু ৩, ৭ নাও") — কিছু না লিখলে ইনপুটে যা আছে সবটাই যোগ হবে।
     </p>
     <div class="unified-input">
       <div id="attach-preview-wrap"></div>
@@ -215,20 +238,23 @@ function openIngestModal(chapterId){
         <button type="button" class="input-icon-btn" id="ingest-attach-btn" title="ছবি সংযুক্ত করো">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h3l2-3h6l2 3h3v13H4V7z"/><circle cx="12" cy="13" r="3.5"/></svg>
         </button>
-        <textarea id="ai-raw-text" rows="1" placeholder="নির্দেশনা বা প্রশ্ন লেখো (ঐচ্ছিক)..."></textarea>
+        <textarea id="ai-raw-text" rows="1" placeholder="নির্দেশনা বা প্রশ্ন লেখো (ঐচ্ছিক)... ছবি paste করতে এখানে ক্লিক করে Ctrl+V দাও"></textarea>
         <button type="button" class="input-send-btn" id="ai-parse-btn" title="পাঠাও">
           <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>
         </button>
       </div>
     </div>
-    <div class="btn-row" style="margin-top:10px;">
+    <div id="ingest-progress" class="hint" style="min-height:16px; margin-bottom:6px;"></div>
+    <div class="btn-row" style="margin-top:4px;">
       <button class="btn" onclick="closeModal()">বন্ধ করো</button>
     </div>
   `);
 
   const ta = document.getElementById('ai-raw-text');
   ta.addEventListener('input', ()=>autoGrowInput(ta));
+  ta.addEventListener('paste', handleIngestPaste);
   setTimeout(()=>ta.focus(), 50);
+
   document.getElementById('ingest-attach-btn').addEventListener('click', ()=>{
     document.getElementById('ingest-file-input').click();
   });
@@ -239,9 +265,7 @@ function autoGrowInput(el){
   el.style.height = 'auto';
   el.style.height = Math.min(el.scrollHeight, 260) + 'px';
 }
-function handleIngestFileSelect(e){
-  const file = e.target.files && e.target.files[0];
-  if(!file) return;
+function readImageFile(file){
   const reader = new FileReader();
   reader.onload = ()=>{
     const result = reader.result || '';
@@ -251,7 +275,22 @@ function handleIngestFileSelect(e){
     renderAttachPreview();
   };
   reader.readAsDataURL(file);
+}
+function handleIngestFileSelect(e){
+  const file = e.target.files && e.target.files[0];
+  if(file) readImageFile(file);
   e.target.value = '';
+}
+function handleIngestPaste(e){
+  const items = (e.clipboardData && e.clipboardData.items) || [];
+  for(const item of items){
+    if(item.type && item.type.indexOf('image/')===0){
+      const file = item.getAsFile();
+      if(file){ e.preventDefault(); readImageFile(file); toast('ছবি সংযুক্ত হয়েছে'); }
+      return;
+    }
+  }
+  // no image on clipboard — let normal text paste happen
 }
 function renderAttachPreview(){
   const wrap = document.getElementById('attach-preview-wrap');
@@ -266,6 +305,14 @@ function clearAttachment(){
   attachedImage = null;
   const wrap = document.getElementById('attach-preview-wrap');
   if(wrap) wrap.innerHTML = '';
+}
+function updateIngestProgress(totalSoFar){
+  const el = document.getElementById('ingest-progress');
+  if(el) el.textContent = totalSoFar ? `এখন পর্যন্ত ${totalSoFar}টি প্রশ্ন সংরক্ষিত হয়েছে, চলছে...` : 'পড়া হচ্ছে...';
+}
+function hideIngestProgress(){
+  const el = document.getElementById('ingest-progress');
+  if(el) el.textContent = '';
 }
 
 /* =====================================================================
