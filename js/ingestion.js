@@ -56,8 +56,18 @@ function fourDistinct(a){
     new Set(a.map(canonIngest)).size===4;
 }
 function explicitSelection(s=''){
-  return /শুধু|কেবল|only|just|দাগানো|চিহ্নিত|মার্ক|marked|selected|highlighted|circled/i.test(s) ||
-    /(?:নম্বর|no\.?|question)\s*[০-৯0-9]+(?:\s*[,ও&]\s*[০-৯0-9]+)+/i.test(s);
+  const text = (s||'').trim();
+  // A genuine "only take 3,7" instruction is always a short command. A long
+  // pasted document can legitimately CONTAIN words like "marked"/"চিহ্নিত"
+  // as part of its own content (e.g. "২য় ছবির চিহ্নিত প্রশ্নসমূহ" describing
+  // where the questions originally came from) without that being an
+  // instruction to the extractor right now. Treating any such word-match
+  // in a long paste as "selective" was capping the whole extraction to a
+  // single round and silently dropping everything after the first few
+  // items — this length guard is what fixes that.
+  if(text.length > 200) return false;
+  return /শুধু|কেবল|only|just|দাগানো|চিহ্নিত|মার্ক|marked|selected|highlighted|circled/i.test(text) ||
+    /(?:নম্বর|no\.?|question)\s*[০-৯0-9]+(?:\s*[,ও&]\s*[০-৯0-9]+)+/i.test(text);
 }
 
 /* ---------------- prompt ---------------- */
@@ -196,7 +206,7 @@ async function runIngest(){
       const { added, newStems } = await ingestOneRound(raw, previous);
       total += added;
       previous.push(...newStems);
-      updateIngestProgress(total, round);
+      updateIngestProgress(total);
       if(!added) break;
     }
     if(total){
@@ -303,12 +313,12 @@ function clearAttachment(){
   const wrap = document.getElementById('attach-preview-wrap');
   if(wrap) wrap.innerHTML = '';
 }
-function updateIngestProgress(totalSoFar, round){
+function updateIngestProgress(totalSoFar){
   const el = document.getElementById('ingest-progress');
   if(!el) return;
   el.textContent = totalSoFar
-    ? `দফা ${round} — এখন পর্যন্ত ${totalSoFar}টি প্রশ্ন সংরক্ষিত হয়েছে...`
-    : `দফা ${round} — পড়া হচ্ছে...`;
+    ? `এখন পর্যন্ত ${totalSoFar}টি প্রশ্ন পাওয়া গেছে, দেখছি আরও কিছু বাকি আছে কিনা...`
+    : 'পড়া হচ্ছে...';
 }
 function hideIngestProgress(){
   const el = document.getElementById('ingest-progress');
