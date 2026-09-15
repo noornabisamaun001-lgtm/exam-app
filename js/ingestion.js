@@ -1,24 +1,35 @@
 /* ingestion.js — question input / ingestion / save
 
-   REWRITE RATIONALE (per product owner): the earlier "cut the text into
-   fixed line/char chunks" approach was the actual bug — it sliced
-   questions in half at arbitrary boundaries, so the AI correctly
-   reported "no valid question found" for a chunk that genuinely
-   contained no complete question. The fix isn't smarter chunking, it's
-   NO mechanical chunking at all.
+   TWO-STEP PIPELINE (this rewrite's core change):
 
-   The AI gets the FULL raw text/image every round and is trusted to use
-   its own judgment about where one question/fact ends and the next
-   begins — numbering present or not, numbering restarting mid-document,
-   several questions crammed into one paragraph with no line breaks,
-   whatever the real-world mess looks like. That's exactly the judgment
-   a person reading the same page would use, and there's no reason to
-   fence the model in with rigid line-count rules it doesn't need.
+   The single-call approach asked the model to do two hard things at once
+   — (a) figure out where each question/fact starts and ends in messy,
+   irregular input, AND (b) build a fully-formed MCQ (options, correct
+   answer, explanation) in strict JSON for every one of them — in one
+   shot. Under that combined load the model was taking the "few but
+   complete" path: fully building a handful of items and treating the
+   rest as done, rather than genuinely covering the whole input.
 
-   The multi-round loop now stops on its own natural signal — a round
-   that adds zero new questions — instead of trusting a self-reported
-   "hasMore" boolean (that boolean is what caused the earlier silent
-   truncation: the model just echoed the example's literal `false`).
+   Splitting those into two separate calls fixes this directly:
+
+   STEP 1 — buildListPrompt(): a LIGHT task. Read the whole input and
+   just list every question/fact found — an index, a type hint, and a
+   faithful one-line summary (with the original math/tags kept intact).
+   No options, no JSON schema pressure beyond a simple list. This is
+   exactly the task a person skimming the page and jotting down "here's
+   Q1, here's Q2..." would do, and it's the part that needs to be
+   exhaustive — so it's kept as cheap and unambiguous as possible.
+
+   STEP 2 — buildElaboratePrompt(): for each small batch (6 at a time)
+   of Step 1's list, build the full MCQ, using the ORIGINAL input again
+   as the source of truth for exact wording/values. Because the boundary
+   question ("where does this item start/end") was already solved in
+   Step 1, batching here is safe — there's no risk of cutting a question
+   in half, since each item was already identified as a whole unit.
+
+   A short, explicit "only take 3,7" instruction skips this pipeline
+   entirely and uses a single direct call — there's no exhaustiveness
+   problem to solve when the ask is already narrow.
 
    Dependencies: core.js, gemini-model.js
 */
@@ -59,42 +70,77 @@ function explicitSelection(s=''){
   const text = (s||'').trim();
   // A genuine "only take 3,7" instruction is always a short command. A long
   // pasted document can legitimately CONTAIN words like "marked"/"চিহ্নিত"
-  // as part of its own content (e.g. "২য় ছবির চিহ্নিত প্রশ্নসমূহ" describing
-  // where the questions originally came from) without that being an
-  // instruction to the extractor right now. Treating any such word-match
-  // in a long paste as "selective" was capping the whole extraction to a
-  // single round and silently dropping everything after the first few
-  // items — this length guard is what fixes that.
+  // as part of its own content without that being an instruction right now.
   if(text.length > 200) return false;
   return /শুধু|কেবল|only|just|দাগানো|চিহ্নিত|মার্ক|marked|selected|highlighted|circled/i.test(text) ||
     /(?:নম্বর|no\.?|question)\s*[০-৯0-9]+(?:\s*[,ও&]\s*[০-৯0-9]+)+/i.test(text);
 }
 
-/* ---------------- prompt ---------------- */
+/* ---------------- STEP 1: list everything found (light task) ---------------- */
+function buildListPrompt(raw=''){
+  const selective = explicitSelection(raw);
+  return `তুমি একজন অভিজ্ঞ শিক্ষক। ইনপুট (ছবি এবং/অথবা টেক্সট) পড়ে বুঝে নিচ্ছো এতে ঠিক কয়টা আলাদা, সম্পূর্ণ প্রশ্ন/গুরুত্বপূর্ণ তথ্য (fact) আছে।
+
+ইনপুট যেকোনো এলোমেলো ফরম্যাটে থাকতে পারে — নাম্বারিং থাকতে পারে বা নাও থাকতে পারে, নাম্বারিং একাধিকবার ১ থেকে আবার শুরু হতে পারে, একাধিক প্রশ্ন কোনো লাইন-ব্রেক ছাড়াই এক প্যারাগ্রাফে গাঁথা থাকতে পারে। এইটা বোঝাটাই এই ধাপের একমাত্র কাজ — ঠিক যেভাবে একজন মানুষ পাতাটা পড়ে খাতায় টুকে রাখত "এই এক প্রশ্ন, এই আরেকটা..."। এই ধাপে কোনো option/answer/explanation বানানোর দরকার নেই, শুধু চিহ্নিত ও তালিকাভুক্ত করো।
+
+${selective ? 'ইনপুটে স্পষ্ট নির্বাচন-নির্দেশনা আছে (যেমন মার্ক/সার্কেল/"শুধু X,Y") — শুধু সেই নির্দিষ্ট অংশগুলোই তালিকায় দাও।' : 'ইনপুটে কোনো নির্বাচন-নির্দেশনা নেই — যত সম্পূর্ণ প্রশ্ন/তথ্য আছে সবগুলোই তালিকাভুক্ত করো, একটাও বাদ দিও না।'}
+
+প্রতিটা entry-তে:
+- idx: ক্রমিক নম্বর (তোমার নিজের গোনা; ইনপুটের নিজের নাম্বারিং অনুসরণ করার দরকার নেই, কারণ সেটা একাধিকবার রিসেট হতে পারে)
+- hint: "numeric" (যদি এতে এমন সংখ্যা/মান থাকে যেগুলো বদলে দিলে একই ধরনের নতুন প্রশ্ন বানানো সম্ভব) অথবা "concept" (সংজ্ঞা/জ্যামিতিক ব্যাখ্যা/যুক্তিভিত্তিক — সংখ্যা বদলে variation বানানো অর্থহীন এমন ক্ষেত্রে)
+- summary: মূল প্রশ্ন/সমীকরণ হুবহু (math notation সহ), কোনো ট্যাগ থাকলে (যেমন [DU'19-20]) সেটাও রাখবে — এতটা সংক্ষিপ্ত কোরো না যে আসল প্রশ্নটাই হারিয়ে যায়
+
+শুধু বৈধ JSON রিটার্ন করবে, অন্য কোনো টেক্সট না:
+{"found":[{"idx":1,"hint":"concept","summary":"..."}]}
+
+ইনপুট:
+${raw || '(শুধু ছবি — মনোযোগ দিয়ে দেখো)'}
+`;
+}
+
+/* ---------------- STEP 2: build full MCQs for one small batch ---------------- */
+function buildElaboratePrompt(raw, batch){
+  const list = batch.map(b=>`idx ${b.idx} (${b.hint}): ${b.summary}`).join('\n');
+  return `তুমি একটি MCQ-নির্মাণ ইঞ্জিন। নিচে মূল ইনপুট (পূর্ণ) দেওয়া আছে, আর একটা তালিকা দেওয়া আছে ঠিক কোন নির্দিষ্ট প্রশ্ন/তথ্যগুলোর জন্য এখন পূর্ণাঙ্গ MCQ বানাতে হবে (idx মিলিয়ে চেনো)। মূল ইনপুট থেকে সেই নির্দিষ্ট অংশের সঠিক মান/সমীকরণ/ভাষা ব্যবহার করবে, অনুমান করবে না।
+
+এখন এই idx গুলোর জন্য পূর্ণাঙ্গ item বানাও:
+${list}
+
+প্রতিটার জন্য:
+- hint "numeric" হলে: stem-এ {var} আকারে placeholder বসাও (মূল প্রশ্নের নির্দিষ্ট সংখ্যাগুলোকে variable বানিয়ে), প্রতিটা variable-এর যুক্তিসঙ্গত min/max range দাও (যাতে পরে ভিন্ন মান বসিয়ে নতুন version বানানো যায়), এবং সেই variable ব্যবহার করে ৪টা বৈধ, গণনাযোগ্য option expression দাও। correctIndex 0-3 (shuffle-এর পর কোনটা সঠিক)।
+- hint "concept" হলে: stem হুবহু মূল প্রশ্ন/তথ্য, ঠিক ৪টা ভিন্ন, plausible option (১টা সঠিক, বাকি ৩টা যুক্তিসঙ্গত ভুল), correctIndex, explanation।
+- উভয় ক্ষেত্রে: মূল concept, সমাধান-পদ্ধতি, উত্তরের যুক্তি অপরিবর্তিত রাখবে — নতুন কিছু আবিষ্কার করবে না। বাংলা/ইংরেজি মূল ভাষা বজায় রাখবে। Math সবসময় $...$ এর ভেতরে লিখবে, ভাঙবে না।
+- দুইটা item কখনো ডুপ্লিকেট হবে না।
+
+শুধু বৈধ JSON রিটার্ন করবে, অন্য কোনো টেক্সট না:
+{"items":[{"idx":1,"type":"concept","stem":"...","options":["...","...","...","..."],"correctIndex":0,"explanation":"..."},{"idx":2,"type":"numeric","stem":"...{a}...","variables":[{"name":"a","min":5,"max":25}],"optionExprs":["...","...","...","..."],"correctIndex":0,"explanation":"..."}]}
+
+মূল ইনপুট:
+${raw || '(শুধু ছবি)'}
+`;
+}
+
+/* ---------------- single-call prompt (selective / short-instruction path only) ---------------- */
 function buildIngestPrompt(raw='', previous=[]){
   const selective = explicitSelection(raw);
   const prevList = previous.slice(-80);
   const prev = prevList.length
-    ? `\nএই stem গুলো ইতিমধ্যে নেওয়া হয়েছে — এগুলো আবার দিও না, এবং এগুলোর ধারাবাহিকতা দেখে বুঝে নাও ইনপুটের বাকি অংশে আর কী কী রয়ে গেছে:\n${prevList.map((x,i)=>`${i+1}. ${x}`).join('\n')}`
+    ? `\nএই stem গুলো ইতিমধ্যে নেওয়া হয়েছে — এগুলো আবার দিও না:\n${prevList.map((x,i)=>`${i+1}. ${x}`).join('\n')}`
     : '';
-
-  return `তুমি একটি নির্ভুল প্রশ্ন-ব্যাংক এক্সট্র্যাকশন ইঞ্জিন। ইনপুটে ছবি এবং/অথবা টেক্সট থাকতে পারে, যেকোনো এলোমেলো ফরম্যাটে — নাম্বারিং থাকতে পারে বা নাও থাকতে পারে, নাম্বারিং একাধিকবার ১ থেকে আবার শুরু হতে পারে, একাধিক প্রশ্ন কোনো লাইন-ব্রেক ছাড়াই এক প্যারাগ্রাফে গাঁথা থাকতে পারে। এই বিশৃঙ্খলা বোঝাটা তোমার নিজের বিচারবুদ্ধির কাজ — ঠিক যেভাবে একজন মানুষ পাতাটা পড়ে বুঝে নিত কোথায় একটা প্রশ্ন/তথ্য শেষ হচ্ছে আর নতুনটা শুরু হচ্ছে, তুমিও সেভাবেই বুঝবে। কোনো নির্দিষ্ট লাইন-সংখ্যা বা ক্যারেক্টার-সংখ্যার নিয়ম মেনে চলার দরকার নেই।
+  return `তুমি একটি নির্ভুল প্রশ্ন-ব্যাংক এক্সট্র্যাকশন ইঞ্জিন। ইনপুটে ছবি এবং/অথবা টেক্সট থাকতে পারে।
 
 সিদ্ধান্তের নিয়ম:
 ১) ছবিতে মার্ক/সার্কেল/হাইলাইট থাকলে অথবা টেক্সটে নির্দিষ্ট কিছু বেছে দেওয়া থাকলে (যেমন: "শুধু ৩,৭ নাও") — কেবল সেই নির্দিষ্ট অংশগুলোই নাও।
-২) এমন কোনো নির্দিষ্ট নির্দেশনা/মার্কিং না থাকলে — ইনপুটে যত সম্পূর্ণ, বৈধ প্রশ্ন/তথ্য আছে সবগুলো থেকেই item বানাও। যতটা এই এক দফায় সম্ভব ততটাই দাও — output সীমার কারণে যদি সবটা এক দফায় না আঁটে, যেগুলো ইতিমধ্যে সম্পূর্ণরূপে বুঝেছ ও যাচাই করেছ সেগুলো দাও, বাকিটা পরের দফায় হবে।
+২) এমন কোনো নির্দিষ্ট নির্দেশনা/মার্কিং না থাকলে — ইনপুটে যত বৈধ প্রশ্ন/তথ্য আছে সবগুলোই নাও।
 ${selective ? '\n→ এই ইনপুটে স্পষ্ট নির্বাচন-নির্দেশনা আছে, তাই নিয়ম ১ প্রযোজ্য।' : '\n→ এই ইনপুটে কোনো নির্বাচন-নির্দেশনা নেই, তাই নিয়ম ২ প্রযোজ্য।'}
 
-গুরুত্বপূর্ণ: ইনপুটের কোনো অংশ যদি অসম্পূর্ণ/কাটা প্রশ্নের মতো মনে হয় (শুরু বা শেষ স্পষ্ট না), সেটাকে item হিসেবে বানিও না — শুধু সম্পূর্ণ, স্পষ্ট প্রশ্ন/তথ্যই নাও।
-
 প্রতিটি item তৈরির সময়:
-- মূল concept, সমাধান পদ্ধতি ও উত্তরের যুক্তি হুবহু বজায় রাখবে। raw textbook lines/তথ্য হলে শুধু সেই নির্দিষ্ট তথ্য থেকেই MCQ বানাবে — বাইরের জ্ঞান/নতুন topic আনবে না।
-- বাংলা/ইংরেজি মূল ভাষা অপরিবর্তিত রাখবে। Math সবসময় $...$ এর ভেতরে লিখবে, ভাঙবে না।
+- মূল concept, সমাধান পদ্ধতি ও উত্তরের যুক্তি হুবহু বজায় রাখবে।
+- বাংলা/ইংরেজি মূল ভাষা অপরিবর্তিত রাখবে। Math সবসময় $...$ এর ভেতরে লিখবে।
 - concept item: ঠিক ৪টি ভিন্ন option এবং exactly ১টি সঠিক উত্তর।
 - numeric item: stem-এ {var} placeholder, প্রতিটি variable-এর min/max range, এবং ৪টি বৈধ, গণনাযোগ্য option expression।
-- figure/diagram থাকলে ছবিতে থাকা প্রকৃত value/relation-ই ব্যবহার করবে, কল্পিত কিছু না।
-- দুইটা item কখনো একে অপরের ডুপ্লিকেট হবে না।
-- শুধু নিচের ফরম্যাটে বৈধ JSON রিটার্ন করবে, অন্য কোনো টেক্সট/মার্কডাউন না।
+- দুইটা item কখনো ডুপ্লিকেট হবে না।
+- শুধু নিচের ফরম্যাটে বৈধ JSON রিটার্ন করবে, অন্য কোনো টেক্সট না।
 ${prev}
 
 JSON ফরম্যাট:
@@ -159,11 +205,8 @@ async function dedupeChapterQuestions(chapterId){
   if(v) v.innerHTML = viewQuestionList(chapterId);
 }
 
-/* One API call against the FULL (unmodified) input + insertion. Any real
-   failure (network, auth, malformed response) is logged to the console
-   instead of being silently swallowed — a failed CALL and a model that
-   genuinely found nothing are very different situations, and hiding the
-   difference is what made this impossible to diagnose. */
+/* One direct API call (single-call path) + insertion. Errors are logged,
+   never silently swallowed. */
 async function ingestOneRound(text, previous){
   let data = null, callError = null;
   try{
@@ -174,7 +217,7 @@ async function ingestOneRound(text, previous){
     });
   }catch(e){
     callError = e;
-    console.error('[ingestion] Gemini call failed:', e);
+    console.error('[ingestion] direct call failed:', e);
   }
   const items = Array.isArray(data?.items) ? data.items : [];
   let added = 0;
@@ -189,6 +232,50 @@ async function ingestOneRound(text, previous){
   return { added, newStems, callError };
 }
 
+/* Two-step pipeline (bulk / non-selective path). Returns {total, hadError}. */
+async function runTwoStepIngest(raw){
+  updateIngestProgress(0, 'তালিকা তৈরি হচ্ছে');
+  let found = [];
+  let hadError = false;
+  try{
+    const data = await callGeminiAPI({
+      text: buildListPrompt(raw),
+      imageBase64: attachedImage?.base64,
+      imageMime: attachedImage?.mime
+    });
+    found = Array.isArray(data?.found) ? data.found.filter(x=>x && cleanIngestText(x.summary)) : [];
+  }catch(e){
+    console.error('[ingestion] list step failed:', e);
+    hadError = true;
+  }
+  if(!found.length) return { total: 0, hadError };
+
+  let total = 0;
+  const batchSize = 6;
+  for(let i=0; i<found.length; i+=batchSize){
+    const batch = found.slice(i, i+batchSize);
+    updateIngestProgress(total, `${i}/${found.length} সম্পন্ন`);
+    let data = null;
+    try{
+      data = await callGeminiAPI({
+        text: buildElaboratePrompt(raw, batch),
+        imageBase64: attachedImage?.base64,
+        imageMime: attachedImage?.mime
+      });
+    }catch(e){
+      console.error('[ingestion] elaborate step failed (batch idx '+(batch[0]&&batch[0].idx)+'+):', e);
+      hadError = true;
+      continue;
+    }
+    const items = Array.isArray(data?.items) ? data.items : [];
+    for(const it of items){
+      if(await insertQuestionFromItem(currentIngestChapterId, it)) total++;
+    }
+    updateIngestProgress(total, `${Math.min(i+batchSize,found.length)}/${found.length} সম্পন্ন`);
+  }
+  return { total, hadError };
+}
+
 /* ---------------- run ingestion ---------------- */
 async function runIngest(){
   const el = document.getElementById('ai-raw-text');
@@ -201,29 +288,25 @@ async function runIngest(){
   const btn = document.getElementById('ai-parse-btn');
   if(btn) btn.disabled = true;
 
-  let total = 0, round = 0, previous = [];
+  let total = 0, hadError = false;
   const selective = explicitSelection(raw);
-  // A selective request ("শুধু ৩,৭") is answered in one pass. A bulk
-  // request loops on the FULL input each time — never a mechanical
-  // slice of it — and stops the moment a round adds nothing new. That's
-  // the actual "is there more?" signal, not a boolean the model reports.
-  const maxRounds = selective ? 1 : 15;
   try{
-    let lastCallError = null;
-    while(round++ < maxRounds){
-      const { added, newStems, callError } = await ingestOneRound(raw, previous);
-      if(callError) lastCallError = callError;
-      total += added;
-      previous.push(...newStems);
-      updateIngestProgress(total);
-      if(!added) break;
+    if(selective){
+      const { added, callError } = await ingestOneRound(raw, []);
+      total = added;
+      hadError = !!callError;
+    } else {
+      const result = await runTwoStepIngest(raw);
+      total = result.total;
+      hadError = result.hadError;
     }
+
     if(total){
       if(el){ el.value=''; autoGrowInput(el); }
       clearAttachment();
       toast(`✓ ${total} টি নতুন প্রশ্ন সংরক্ষিত হয়েছে`);
-    } else if(lastCallError){
-      toast('AI service-এ সমস্যা হয়েছে (নেটওয়ার্ক/key/অন্য কিছু) — F12 দিয়ে Console-এ বিস্তারিত দেখা যাবে');
+    } else if(hadError){
+      toast('AI service-এ সমস্যা হয়েছে — F12 দিয়ে Console-এ বিস্তারিত দেখা যাবে');
     } else {
       toast('নতুন কোনো বৈধ প্রশ্ন পাওয়া যায়নি');
     }
@@ -324,12 +407,11 @@ function clearAttachment(){
   const wrap = document.getElementById('attach-preview-wrap');
   if(wrap) wrap.innerHTML = '';
 }
-function updateIngestProgress(totalSoFar){
+function updateIngestProgress(totalSoFar, label){
   const el = document.getElementById('ingest-progress');
   if(!el) return;
-  el.textContent = totalSoFar
-    ? `এখন পর্যন্ত ${totalSoFar}টি প্রশ্ন পাওয়া গেছে, দেখছি আরও কিছু বাকি আছে কিনা...`
-    : 'পড়া হচ্ছে...';
+  const base = totalSoFar ? `এখন পর্যন্ত ${totalSoFar}টি প্রশ্ন পাওয়া গেছে` : 'পড়া হচ্ছে';
+  el.textContent = label ? `${base} (${label})...` : `${base}...`;
 }
 function hideIngestProgress(){
   const el = document.getElementById('ingest-progress');
