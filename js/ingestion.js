@@ -159,16 +159,23 @@ async function dedupeChapterQuestions(chapterId){
   if(v) v.innerHTML = viewQuestionList(chapterId);
 }
 
-/* One API call against the FULL (unmodified) input + insertion. */
+/* One API call against the FULL (unmodified) input + insertion. Any real
+   failure (network, auth, malformed response) is logged to the console
+   instead of being silently swallowed — a failed CALL and a model that
+   genuinely found nothing are very different situations, and hiding the
+   difference is what made this impossible to diagnose. */
 async function ingestOneRound(text, previous){
-  let data = null;
+  let data = null, callError = null;
   try{
     data = await callGeminiAPI({
       text: buildIngestPrompt(text, previous),
       imageBase64: attachedImage?.base64,
       imageMime: attachedImage?.mime
     });
-  }catch(e){}
+  }catch(e){
+    callError = e;
+    console.error('[ingestion] Gemini call failed:', e);
+  }
   const items = Array.isArray(data?.items) ? data.items : [];
   let added = 0;
   const newStems = [];
@@ -179,7 +186,7 @@ async function ingestOneRound(text, previous){
     }
   }
   if(added) await saveQuestions();
-  return { added, newStems };
+  return { added, newStems, callError };
 }
 
 /* ---------------- run ingestion ---------------- */
@@ -202,8 +209,10 @@ async function runIngest(){
   // the actual "is there more?" signal, not a boolean the model reports.
   const maxRounds = selective ? 1 : 15;
   try{
+    let lastCallError = null;
     while(round++ < maxRounds){
-      const { added, newStems } = await ingestOneRound(raw, previous);
+      const { added, newStems, callError } = await ingestOneRound(raw, previous);
+      if(callError) lastCallError = callError;
       total += added;
       previous.push(...newStems);
       updateIngestProgress(total);
@@ -213,6 +222,8 @@ async function runIngest(){
       if(el){ el.value=''; autoGrowInput(el); }
       clearAttachment();
       toast(`✓ ${total} টি নতুন প্রশ্ন সংরক্ষিত হয়েছে`);
+    } else if(lastCallError){
+      toast('AI service-এ সমস্যা হয়েছে (নেটওয়ার্ক/key/অন্য কিছু) — F12 দিয়ে Console-এ বিস্তারিত দেখা যাবে');
     } else {
       toast('নতুন কোনো বৈধ প্রশ্ন পাওয়া যায়নি');
     }
