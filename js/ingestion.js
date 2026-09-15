@@ -251,10 +251,10 @@ async function runTwoStepIngest(raw){
   if(!found.length) return { total: 0, hadError };
 
   let total = 0;
-  const batchSize = 6;
-  for(let i=0; i<found.length; i+=batchSize){
-    const batch = found.slice(i, i+batchSize);
-    updateIngestProgress(total, `${i}/${found.length} সম্পন্ন`);
+  let doneCount = 0;
+  const savedIdx = new Set();
+
+  async function runElaborateBatch(batch){
     let data = null;
     try{
       data = await callGeminiAPI({
@@ -263,16 +263,40 @@ async function runTwoStepIngest(raw){
         imageMime: attachedImage?.mime
       });
     }catch(e){
-      console.error('[ingestion] elaborate step failed (batch idx '+(batch[0]&&batch[0].idx)+'+):', e);
+      console.error('[ingestion] elaborate batch failed (idx '+batch.map(b=>b.idx).join(',')+'):', e);
       hadError = true;
-      continue;
+      return;
     }
     const items = Array.isArray(data?.items) ? data.items : [];
     for(const it of items){
-      if(await insertQuestionFromItem(currentIngestChapterId, it)) total++;
+      const ok = await insertQuestionFromItem(currentIngestChapterId, it);
+      if(ok){ total++; if(it && it.idx!=null) savedIdx.add(it.idx); }
+      else if(it && it.idx!=null){ console.warn('[ingestion] idx', it.idx, 'rejected (failed validation or duplicate):', it); }
     }
-    updateIngestProgress(total, `${Math.min(i+batchSize,found.length)}/${found.length} সম্পন্ন`);
+    doneCount += batch.length;
+    updateIngestProgress(total, `${Math.min(doneCount,found.length)}/${found.length} সম্পন্ন`);
   }
+
+  // Main pass: batches of 10, up to 3 running at once — this is what cuts
+  // the wall-clock time down instead of waiting on one batch at a time.
+  const batchSize = 10;
+  const batches = [];
+  for(let i=0; i<found.length; i+=batchSize) batches.push(found.slice(i, i+batchSize));
+  await runWithConcurrency(batches.map(b => () => runElaborateBatch(b)), 3);
+
+  // Retry pass: anything Step 1 found but didn't end up saved (model
+  // skipped it, or it failed validation) gets a focused, solo attempt —
+  // no batch competing for the model's attention — up to 2 rounds. This
+  // is what stops items from silently vanishing.
+  let retryRound = 0;
+  let missing = found.filter(f => !savedIdx.has(f.idx));
+  while(missing.length && retryRound < 2){
+    retryRound++;
+    updateIngestProgress(total, `${found.length-missing.length}/${found.length} সম্পন্ন, ${missing.length}টা আবার চেষ্টা হচ্ছে`);
+    await runWithConcurrency(missing.map(item => () => runElaborateBatch([item])), 3);
+    missing = found.filter(f => !savedIdx.has(f.idx));
+  }
+
   return { total, hadError };
 }
 
