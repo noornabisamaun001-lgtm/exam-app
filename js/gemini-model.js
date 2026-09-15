@@ -119,7 +119,7 @@ async function callGeminiAPI({text, imageBase64, imageMime}){
 
   async function fetchOnce(model, includeThinkingToggle){
     const cfg = { temperature: 0.6, maxOutputTokens: 32768 };
-    if(includeThinkingToggle) cfg.thinkingConfig = { thinkingBudget: 0 }; // disable "thinking" — it was eating the output budget and truncating our JSON
+    if(includeThinkingToggle) cfg.thinkingConfig = { thinkingBudget: -1 }; // dynamic thinking — model decides how much reasoning it needs. Forcing this to 0 was blocking the model from reasoning through messy/irregular extraction input at all; that budget concern only applied under the old 8192 cap.
     const reqBody = { contents: [{ role: 'user', parts }], generationConfig: cfg };
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
     const res = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(reqBody) });
@@ -138,7 +138,9 @@ async function callGeminiAPI({text, imageBase64, imageMime}){
       err.status = res.status;
       throw err;
     }
-    // Drop any leftover "thinking" parts defensively — keep only the real answer text.
+    // Drop "thought" parts — keep only the real answer text. Thinking is
+    // now dynamic (not forced off), so a response can legitimately include
+    // reasoning parts ahead of the actual JSON; this strips them either way.
     const rawParts = data?.candidates?.[0]?.content?.parts || [];
     const outText = rawParts.filter(p=>!p.thought).map(p=>p.text||'').join('');
     if(!outText) throw new Error('EMPTY_RESPONSE');
