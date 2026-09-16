@@ -14,10 +14,19 @@
    when the entire pool is exhausted does the exam actually fall short,
    and that's reported honestly via examSkippedCount.
 
-   Also carried over from before: round-robin interleaving (buildNeedItems)
-   so the same pattern doesn't cluster, and per-source generation history
-   sent to the AI so it stops producing trivial sign-flip/reciprocal
-   "variations" of the same question.
+   ALSO FIXED THIS ROUND: buildNeedItems previously reshuffled a fresh
+   "round" order every pass, which only guaranteed no-same-source-twice
+   WITHIN a round — nothing stopped the same source from landing last in
+   round R and first in round R+1, producing exactly the back-to-back
+   clustering seen in real exams (e.g. four "|z-a|/|z-b|=c" locus
+   questions in a row). Replaced with a greedy "most-remaining-first,
+   never repeat the immediately-previous source" scheduler, which
+   guarantees no two adjacent slots share a source whenever that's
+   mathematically possible for the given pool/need sizes.
+
+   Also carried over from before: per-source generation history sent to
+   the AI so it stops producing trivial sign-flip/reciprocal "variations"
+   of the same question.
 */
 let examSkippedCount=0;
 let sourceVariationHistory=new Map(); // sourceId -> stems already generated this exam
@@ -82,21 +91,41 @@ function generateNumericInstant(it, usedSig){
 function fallbackFromConcept(){ return null; }
 function pickUnusedFallback(){ return null; }
 
-/* ---------------- need calculation — round-robin interleaved ---------------- */
+/* ---------------- need calculation — no-adjacent-repeat scheduling ----------------
+   Distributes `n` slots across `pool` sources as evenly as possible (extras
+   randomized across sources so it isn't always the same ones getting the
+   +1), then walks a greedy scheduler: at every step, place a slot from
+   whichever source(s) currently have the most remaining, picking randomly
+   among ties, but never repeating the source that was placed immediately
+   before. This guarantees no two ADJACENT slots share a source whenever
+   that's mathematically possible (i.e. unless one source's need is more
+   than half of n, in which case some adjacency is unavoidable and the
+   scheduler falls back to the least-bad option). */
 function buildNeedItems(pool, n){
-  const p = shuffleArr([...pool]);
-  if(p.length===0) return { numericNeed:[], conceptNeed:[] };
+  if(!pool.length) return { numericNeed:[], conceptNeed:[] };
 
-  const counts = new Array(p.length).fill(0);
-  for(let i=0;i<n;i++) counts[i % p.length]++;
+  const base = Math.floor(n / pool.length);
+  const remainder = n % pool.length;
+  const extraSet = new Set(shuffleArr(pool.map((_,i)=>i)).slice(0, remainder));
+  const remaining = pool
+    .map((_,i)=>({ i, c: base + (extraSet.has(i) ? 1 : 0) }))
+    .filter(x=>x.c>0);
 
-  const maxCount = Math.max(...counts);
   const slots = [];
-  for(let round=0; round<maxCount; round++){
-    const order = shuffleArr(p.map((_,i)=>i));
-    for(const i of order){
-      if(round < counts[i]) slots.push(p[i]);
+  let lastIdx = -1;
+  while(slots.length < n && remaining.length){
+    remaining.sort((a,b)=> b.c - a.c);
+    const topCount = remaining[0].c;
+    const tier = remaining.filter(x=>x.c===topCount);
+    let pick = tier.length>1 ? tier[Math.floor(Math.random()*tier.length)] : tier[0];
+    if(pick.i===lastIdx){
+      const alt = tier.find(x=>x.i!==lastIdx) || remaining.find(x=>x.i!==lastIdx);
+      if(alt) pick = alt; // else: unavoidable repeat, pool too small for a gap here
     }
+    slots.push(pool[pick.i]);
+    pick.c--;
+    lastIdx = pick.i;
+    if(pick.c===0) remaining.splice(remaining.indexOf(pick),1);
   }
 
   return {
