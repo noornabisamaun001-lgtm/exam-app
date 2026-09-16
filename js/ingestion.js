@@ -20,12 +20,18 @@
    Q1, here's Q2..." would do, and it's the part that needs to be
    exhaustive — so it's kept as cheap and unambiguous as possible.
 
-   STEP 2 — buildElaboratePrompt(): for each small batch (6 at a time)
-   of Step 1's list, build the full MCQ, using the ORIGINAL input again
-   as the source of truth for exact wording/values. Because the boundary
-   question ("where does this item start/end") was already solved in
-   Step 1, batching here is safe — there's no risk of cutting a question
-   in half, since each item was already identified as a whole unit.
+   STEP 2 — buildElaboratePrompt(): for each item from Step 1's list,
+   build the full MCQ, using the ORIGINAL input again as the source of
+   truth for exact wording/values. Because the boundary question
+   ("where does this item start/end") was already solved in Step 1,
+   each item is sent ONE AT A TIME (no batching, no parallel calls) —
+   this is what actually fixed the "37 found but only 22-27 saved"
+   problem: batching/parallel re-introduced the same "juggle many
+   things at once, drop some" failure mode at a smaller scale, plus
+   it multiplied request/token volume in a short window (free-tier
+   rate-limit risk). One item per call, one call at a time, is slower
+   wall-clock but each item gets the model's full attention and never
+   competes against rate limits from its own siblings.
 
    A short, explicit "only take 3,7" instruction skips this pipeline
    entirely and uses a single direct call — there's no exhaustiveness
@@ -98,22 +104,21 @@ ${raw || '(শুধু ছবি — মনোযোগ দিয়ে দে�
 `;
 }
 
-/* ---------------- STEP 2: build full MCQs for one small batch ---------------- */
-function buildElaboratePrompt(raw, batch){
-  const list = batch.map(b=>`idx ${b.idx} (${b.hint}): ${b.summary}`).join('\n');
-  return `তুমি একটি MCQ-নির্মাণ ইঞ্জিন। নিচে মূল ইনপুট (পূর্ণ) দেওয়া আছে, আর একটা তালিকা দেওয়া আছে ঠিক কোন নির্দিষ্ট প্রশ্ন/তথ্যগুলোর জন্য এখন পূর্ণাঙ্গ MCQ বানাতে হবে (idx মিলিয়ে চেনো)। মূল ইনপুট থেকে সেই নির্দিষ্ট অংশের সঠিক মান/সমীকরণ/ভাষা ব্যবহার করবে, অনুমান করবে না।
+/* ---------------- STEP 2: build full MCQ for ONE item (no batching) ---------------- */
+function buildElaboratePrompt(raw, item){
+  return `তুমি একটি MCQ-নির্মাণ ইঞ্জিন। নিচে মূল ইনপুট (পূর্ণ) দেওয়া আছে, আর একটা নির্দিষ্ট প্রশ্ন/তথ্য চিহ্নিত করা আছে (idx মিলিয়ে চেনো) — এখন শুধু এই একটার জন্যই পূর্ণাঙ্গ MCQ বানাতে হবে। মূল ইনপুট থেকে এই নির্দিষ্ট অংশের সঠিক মান/সমীকরণ/ভাষা ব্যবহার করবে, অনুমান করবে না।
 
-এখন এই idx গুলোর জন্য পূর্ণাঙ্গ item বানাও:
-${list}
+এই idx-এর জন্য পূর্ণাঙ্গ item বানাও:
+idx ${item.idx} (${item.hint}): ${item.summary}
 
-প্রতিটার জন্য:
 - hint "numeric" হলে: stem-এ {var} আকারে placeholder বসাও (মূল প্রশ্নের নির্দিষ্ট সংখ্যাগুলোকে variable বানিয়ে), প্রতিটা variable-এর যুক্তিসঙ্গত min/max range দাও (যাতে পরে ভিন্ন মান বসিয়ে নতুন version বানানো যায়), এবং সেই variable ব্যবহার করে ৪টা বৈধ, গণনাযোগ্য option expression দাও। correctIndex 0-3 (shuffle-এর পর কোনটা সঠিক)।
 - hint "concept" হলে: stem হুবহু মূল প্রশ্ন/তথ্য, ঠিক ৪টা ভিন্ন, plausible option (১টা সঠিক, বাকি ৩টা যুক্তিসঙ্গত ভুল), correctIndex, explanation।
 - উভয় ক্ষেত্রে: মূল concept, সমাধান-পদ্ধতি, উত্তরের যুক্তি অপরিবর্তিত রাখবে — নতুন কিছু আবিষ্কার করবে না। বাংলা/ইংরেজি মূল ভাষা বজায় রাখবে। Math সবসময় $...$ এর ভেতরে লিখবে, ভাঙবে না।
-- দুইটা item কখনো ডুপ্লিকেট হবে না।
 
 শুধু বৈধ JSON রিটার্ন করবে, অন্য কোনো টেক্সট না:
-{"items":[{"idx":1,"type":"concept","stem":"...","options":["...","...","...","..."],"correctIndex":0,"explanation":"..."},{"idx":2,"type":"numeric","stem":"...{a}...","variables":[{"name":"a","min":5,"max":25}],"optionExprs":["...","...","...","..."],"correctIndex":0,"explanation":"..."}]}
+{"items":[{"idx":${item.idx},"type":"concept","stem":"...","options":["...","...","...","..."],"correctIndex":0,"explanation":"..."}]}
+
+(numeric হলে items[0]-তে "type":"numeric","stem":"...{a}...","variables":[{"name":"a","min":5,"max":25}],"optionExprs":["...","...","...","..."],"correctIndex":0,"explanation":"..." ব্যবহার করবে)
 
 মূল ইনপুট:
 ${raw || '(শুধু ছবি)'}
@@ -232,7 +237,14 @@ async function ingestOneRound(text, previous){
   return { added, newStems, callError };
 }
 
-/* Two-step pipeline (bulk / non-selective path). Returns {total, hadError}. */
+/* Two-step pipeline (bulk / non-selective path). Returns {total, hadError, failedIdx}.
+   Step 2 now runs ONE ITEM PER CALL, SEQUENTIALLY (no batching, no
+   concurrency) — this is the direct fix for "37 found but only 22-27
+   saved": batching/parallel were re-creating the exact "too much at
+   once, some dropped" problem the two-step split was meant to solve,
+   just at a smaller scale, and parallel calls were also spiking
+   request/token volume (free-tier rate-limit risk) since each call
+   resends the full raw input. */
 async function runTwoStepIngest(raw){
   updateIngestProgress(0, 'তালিকা তৈরি হচ্ছে');
   let found = [];
@@ -248,56 +260,67 @@ async function runTwoStepIngest(raw){
     console.error('[ingestion] list step failed:', e);
     hadError = true;
   }
-  if(!found.length) return { total: 0, hadError };
+  if(!found.length) return { total: 0, hadError, failedIdx: [] };
 
   let total = 0;
-  let doneCount = 0;
   const savedIdx = new Set();
+  const failedIdx = []; // {idx, reason} — surfaced to the user, not just console
 
-  async function runElaborateBatch(batch){
+  async function runOneItem(item, label){
     let data = null;
     try{
       data = await callGeminiAPI({
-        text: buildElaboratePrompt(raw, batch),
+        text: buildElaboratePrompt(raw, item),
         imageBase64: attachedImage?.base64,
         imageMime: attachedImage?.mime
       });
     }catch(e){
-      console.error('[ingestion] elaborate batch failed (idx '+batch.map(b=>b.idx).join(',')+'):', e);
-      hadError = true;
+      console.error('[ingestion] item idx '+item.idx+' call failed:', e);
+      failedIdx.push({ idx: item.idx, reason: 'call-failed' });
       return;
     }
-    const items = Array.isArray(data?.items) ? data.items : [];
-    for(const it of items){
-      const ok = await insertQuestionFromItem(currentIngestChapterId, it);
-      if(ok){ total++; if(it && it.idx!=null) savedIdx.add(it.idx); }
-      else if(it && it.idx!=null){ console.warn('[ingestion] idx', it.idx, 'rejected (failed validation or duplicate):', it); }
+    const returned = Array.isArray(data?.items) ? data.items[0] : null;
+    if(!returned){
+      failedIdx.push({ idx: item.idx, reason: 'empty-response' });
+      return;
     }
-    doneCount += batch.length;
-    updateIngestProgress(total, `${Math.min(doneCount,found.length)}/${found.length} সম্পন্ন`);
+    const ok = await insertQuestionFromItem(currentIngestChapterId, returned);
+    if(ok){
+      total++; savedIdx.add(item.idx);
+    } else {
+      console.warn('[ingestion] idx', item.idx, 'rejected (failed validation or duplicate):', returned);
+      failedIdx.push({ idx: item.idx, reason: 'validation-or-duplicate' });
+    }
+    updateIngestProgress(total, `${label} — ${savedIdx.size}/${found.length} সম্পন্ন`);
   }
 
-  // Main pass: batches of 10, up to 3 running at once — this is what cuts
-  // the wall-clock time down instead of waiting on one batch at a time.
-  const batchSize = 10;
-  const batches = [];
-  for(let i=0; i<found.length; i+=batchSize) batches.push(found.slice(i, i+batchSize));
-  await runWithConcurrency(batches.map(b => () => runElaborateBatch(b)), 3);
+  // Main pass: strictly sequential, one item per call. Slower wall-clock
+  // than the old parallel-batch approach, but every item gets a solo,
+  // full-attention call and nothing competes for rate-limit headroom.
+  for(const item of found){
+    await runOneItem(item, 'প্রধান ধাপ');
+  }
 
-  // Retry pass: anything Step 1 found but didn't end up saved (model
-  // skipped it, or it failed validation) gets a focused, solo attempt —
-  // no batch competing for the model's attention — up to 2 rounds. This
-  // is what stops items from silently vanishing.
+  // Retry pass: anything that failed (call error, empty response, or
+  // rejected at validation/duplicate) gets one more solo attempt, up to
+  // 2 rounds — still sequential, still one at a time.
   let retryRound = 0;
   let missing = found.filter(f => !savedIdx.has(f.idx));
   while(missing.length && retryRound < 2){
     retryRound++;
-    updateIngestProgress(total, `${found.length-missing.length}/${found.length} সম্পন্ন, ${missing.length}টা আবার চেষ্টা হচ্ছে`);
-    await runWithConcurrency(missing.map(item => () => runElaborateBatch([item])), 3);
+    failedIdx.length = 0; // this round's failures replace the previous round's list
+    updateIngestProgress(total, `${savedIdx.size}/${found.length} সম্পন্ন, ${missing.length}টা আবার চেষ্টা হচ্ছে (${retryRound}/2)`);
+    for(const item of missing){
+      await runOneItem(item, `রিট্রাই ${retryRound}/2`);
+    }
     missing = found.filter(f => !savedIdx.has(f.idx));
   }
 
-  return { total, hadError };
+  if(missing.length){
+    console.warn('[ingestion] permanently failed after retries:', missing.map(f=>({idx:f.idx, summary:f.summary})));
+  }
+
+  return { total, hadError, failedIdx: missing.map(f=>f.idx) };
 }
 
 /* ---------------- run ingestion ---------------- */
@@ -312,7 +335,7 @@ async function runIngest(){
   const btn = document.getElementById('ai-parse-btn');
   if(btn) btn.disabled = true;
 
-  let total = 0, hadError = false;
+  let total = 0, hadError = false, failedIdx = [];
   const selective = explicitSelection(raw);
   try{
     if(selective){
@@ -323,12 +346,17 @@ async function runIngest(){
       const result = await runTwoStepIngest(raw);
       total = result.total;
       hadError = result.hadError;
+      failedIdx = result.failedIdx || [];
     }
 
     if(total){
       if(el){ el.value=''; autoGrowInput(el); }
       clearAttachment();
-      toast(`✓ ${total} টি নতুন প্রশ্ন সংরক্ষিত হয়েছে`);
+      if(failedIdx.length){
+        toast(`✓ ${total} টি প্রশ্ন সংরক্ষিত হয়েছে, ${failedIdx.length} টি ব্যর্থ হয়েছে (idx: ${failedIdx.join(', ')})`);
+      } else {
+        toast(`✓ ${total} টি নতুন প্রশ্ন সংরক্ষিত হয়েছে`);
+      }
     } else if(hadError){
       toast('AI service-এ সমস্যা হয়েছে — F12 দিয়ে Console-এ বিস্তারিত দেখা যাবে');
     } else {
